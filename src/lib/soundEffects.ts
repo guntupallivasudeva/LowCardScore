@@ -1,12 +1,17 @@
 'use client';
 
-const STORAGE_SOUND_GLOBAL_KEY = 'leastscore_sound_enabled_v1';
+const STORAGE_SOUND_GLOBAL_KEY = 'lowscore_sound_enabled_v1';
+const LEGACY_SOUND_GLOBAL_KEY = 'leastscore_sound_enabled_v1';
 
 function getUserSoundKey(userId?: string): string {
-  return userId ? `leastscore_sound_pref_${userId}` : STORAGE_SOUND_GLOBAL_KEY;
+  return userId ? `lowscore_sound_pref_${userId}` : STORAGE_SOUND_GLOBAL_KEY;
 }
 
-// Lightweight Web Audio API sound synthesizer matching LeastScore cues (no external MP3 dependencies)
+function getLegacyUserSoundKey(userId?: string): string {
+  return userId ? `leastscore_sound_pref_${userId}` : LEGACY_SOUND_GLOBAL_KEY;
+}
+
+// Lightweight Web Audio API sound synthesizer matching LowScore cues (no external MP3 dependencies)
 class SoundEngine {
   private ctx: AudioContext | null = null;
   public enabled = true;
@@ -15,8 +20,13 @@ class SoundEngine {
   loadPreference(userId?: string): boolean {
     if (typeof window === 'undefined') return this.enabled;
     try {
-      const userVal = userId ? localStorage.getItem(getUserSoundKey(userId)) : null;
-      const globalVal = localStorage.getItem(STORAGE_SOUND_GLOBAL_KEY);
+      const userVal = userId
+        ? localStorage.getItem(getUserSoundKey(userId)) ??
+          localStorage.getItem(getLegacyUserSoundKey(userId))
+        : null;
+      const globalVal =
+        localStorage.getItem(STORAGE_SOUND_GLOBAL_KEY) ??
+        localStorage.getItem(LEGACY_SOUND_GLOBAL_KEY);
       const raw = userVal !== null ? userVal : globalVal;
       if (raw !== null) {
         const parsed = raw === 'true';

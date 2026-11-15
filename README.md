@@ -1,65 +1,117 @@
-# LowCardScore (LowScore)
+# LowScore — Strategic Low-Sum Card Game
 
-A real-time multiplayer strategic **Low-Sum Card Game** built with **Next.js 15**, **React 19**, **TypeScript**, and **Tailwind CSS**. Create private rooms with 5-character share codes, challenge friends or smart AI bots, and aim for the lowest hand sum before hitting the elimination threshold.
+A mobile-friendly multiplayer card game built with **Next.js 15 App Router**, **TypeScript**, **Tailwind CSS**, **Better Auth**, and **Cloudflare Workers + Cloudflare D1** (Free Tier).
 
-## Features
+## Architecture (100% Cloudflare Free Stack)
 
-- **Multiplayer Private Tables**: Create or join 2–8 player rooms using a 5-character lobby code or direct invite link (`/?join=CODE`), with built-in WhatsApp share and lobby/in-game chat.
-- **Configurable Match Rules**: Customize elimination score (`50–300`), starting hand size (`3–7` cards), max players (`2–8`), turn timer (`15–90s`), and Easy/Hard AI bots.
-- **Full Card Game Engine**: Supports 1-card drops, Pairs, 3-card Sequences, Four of a Kind, 5-card Sequences, and 5-card Flushes, plus **Declare** and **Undercut** (`+20 + diff`) scoring.
-- **Smart Assistance & Rejoin**: Built-in optimal move Hint & Auto-Play toggle, 5-minute temporary "Step Away" rejoin window where a bot plays your turns, Spectator mode after elimination, and synthesized Web Audio sound effects.
-- **Optional Supabase Auth**: Uses Supabase Auth when configured via environment variables, or falls back to a built-in temporary store + instant Guest Play.
+- **Hosting & Runtime**: Cloudflare Workers + Workers Static Assets via [`@opennextjs/cloudflare`](https://opennext.js.org/cloudflare)
+- **Database (Free Tier SQL)**: Cloudflare D1 (`lowscore-db` binding `DB`) storing:
+  - **Better Auth** tables (`user`, `session`, `account`, `verification`)
+  - **`player_preferences`** (per-player sound mute/unmute & display name)
+  - **`game_rooms`** (active multiplayer lobby & table state, 24h TTL)
+- **Authentication**: [`better-auth`](https://www.better-auth.com/) with Email/Password (`PBKDF2-SHA256` WebCrypto hashing under `<1ms` CPU to fit cleanly inside Cloudflare Workers Free Tier's 10ms CPU limit) + instant **Guest Mode**.
+- **Anti-Cache & Refresh Continuity**: API routes enforce `force-dynamic` and `Cache-Control: no-store, no-cache, must-revalidate`. Refreshing mid-game reconnects seamlessly via URL `?room=CODE` + saved room/table state (`autoPlay`, card selection, draw choice, panel state).
 
-## Tech Stack
-
-- **Framework**: Next.js 15 (App Router + API Route Handlers)
-- **UI**: React 19, Tailwind CSS, Lucide Icons, custom SVG 52-card deck
-- **Auth (Optional)**: `@supabase/supabase-js`
-- **CI**: GitHub Actions (`.github/workflows/ci.yml`)
+---
 
 ## Local Development
 
-1. **Install dependencies**
-
+1. Install dependencies:
    ```bash
    npm install
    ```
 
-2. **Configure environment variables (optional)**
-
-   Copy `.env.example` to `.env.local` if you want to enable Supabase Authentication. Never commit `.env.local` or any real keys.
-
+2. Create local Wrangler secrets (gitignored `.dev.vars`):
    ```bash
-   cp .env.example .env.local
+   cp .env.example .dev.vars
+   # Put a random 32+ char hex secret into BETTER_AUTH_SECRET inside .dev.vars
+   openssl rand -hex 32
    ```
 
-   | Variable | Required | Purpose |
-   | --- | --- | --- |
-   | `NEXT_PUBLIC_SUPABASE_URL` | Optional | Supabase project URL for user login/signup |
-   | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Optional | Supabase public anon key (used if service role key is not set) |
-   | `SUPABASE_SERVICE_ROLE_KEY` | Optional | Server-only Supabase key for `/api/auth` (keep secret) |
+3. Apply D1 SQL migrations locally:
+   ```bash
+   npm run db:migrate:local
+   ```
 
-3. **Run the development server**
-
+4. Start Next.js dev server (connected to local Wrangler/Miniflare D1 via `initOpenNextCloudflareForDev()`):
    ```bash
    npm run dev
    ```
 
-   Open `http://localhost:3000`.
-
-4. **Verify typecheck & production build**
-
+5. Preview directly inside local Cloudflare `workerd` runtime:
    ```bash
-   npx tsc --noEmit
-   npm run build
+   npm run cf:preview
    ```
 
-## Free Deployment Architecture Notes
+---
 
-- **Important State Note (`src/lib/serverStore.ts`)**: Currently, active game rooms and fallback users are stored in Node.js process memory (`globalThis`) and `/tmp/*.json`.
-  - **Single-container free hosts** (such as **Render** Free Web Service) share one Node process while awake, so in-memory multiplayer works out of the box (though free instances sleep after inactivity and wipe `/tmp` on restarts).
-  - **Edge / Serverless free hosts** (such as **Cloudflare Workers** via `@opennextjs/cloudflare` or **Vercel** Hobby) isolate memory and `/tmp` across requests/edge locations. For reliable multi-device gameplay on Cloudflare Workers Free Tier, back `serverStore.ts` with **Cloudflare Durable Objects (SQLite)** for room state and **Cloudflare D1** or **Supabase** for user accounts.
+## Deploying to Cloudflare (Free Tier)
 
-## License
+No credit card or R2 bucket is needed — everything runs on **Cloudflare Workers Free Plan** + **Cloudflare D1 Free Plan**.
 
-Private/personal project repository.
+1. Authenticate Wrangler with your Cloudflare account:
+   ```bash
+   npx wrangler login
+   ```
+
+2. Configure the D1 database (`lowscore-db` is already provisioned and linked in [`wrangler.jsonc`](wrangler.jsonc) with [`migrations/0001_init.sql`](migrations/0001_init.sql); if deploying to a different Cloudflare account, create a new DB and replace `database_id`):
+   ```bash
+   npx wrangler d1 create lowscore-db
+   npm run db:migrate:remote
+   ```
+
+3. Set your production Better Auth secret (required before signing up/signing in in production):
+   ```bash
+   openssl rand -hex 32 | npx wrangler secret put BETTER_AUTH_SECRET
+   ```
+
+4. Build & deploy the OpenNext Worker to Cloudflare:
+   ```bash
+   npm run cf:deploy
+   ```
+
+5. Optional: set `BETTER_AUTH_URL` to your deployed `https://<your-worker>.<subdomain>.workers.dev` URL (or custom domain) in Cloudflare Dashboard → Worker Settings → Variables and Secrets, or via `npx wrangler secret put BETTER_AUTH_URL`. When omitted, auth origins fall back automatically to the incoming HTTPS request host.
+
+---
+
+## CI/CD Pipeline
+
+Every push and pull request targeting `main` runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+
+1. `npm ci` + `npx tsc --noEmit`
+2. `npm run cf:build` (Next.js production build + OpenNext Cloudflare Workers bundle)
+3. `npx wrangler deploy --dry-run` (validates `wrangler.jsonc`, static assets, D1 binding, and 3 MiB Free Tier bundle limit without credentials)
+4. `npm audit --audit-level=high` (advisory security audit)
+
+### Option A: Auto-Deploy via GitHub Actions
+
+Add these **Repository Secrets** in **GitHub → Settings → Secrets and variables → Actions**:
+
+- `CLOUDFLARE_API_TOKEN` — Cloudflare API Token with *Workers Scripts: Edit*, *Workers Routes: Edit*, *Account Settings: Read*, and *D1: Edit*
+- `CLOUDFLARE_ACCOUNT_ID` — Your Cloudflare Account ID
+- `BETTER_AUTH_SECRET` — A 32+ byte random hex secret (`openssl rand -hex 32`)
+
+Once set, pushes to `main` automatically apply D1 migrations, deploy the OpenNext Worker, and sync `BETTER_AUTH_SECRET`.
+
+### Option B: Auto-Deploy via Cloudflare Workers Builds (Zero Tokens in GitHub)
+
+In the **Cloudflare Dashboard → Workers & Pages → Create → Workers → Import a repository**, connect `guntupallivasudeva/LowCardScore` (`main`) with:
+
+- **Build command**: `npm run cf:build`
+- **Deploy command**: `npx opennextjs-cloudflare deploy`
+- **Runtime Secrets**: Add `BETTER_AUTH_SECRET` under Worker **Settings → Variables and Secrets**.
+
+---
+
+## Scripts
+
+| Command | Description |
+| :--- | :--- |
+| `npm run dev` | Local Next.js dev server with Cloudflare D1 bindings |
+| `npm run build` | Standard Next.js production build |
+| `npm run cf:build` | Build `.open-next` Cloudflare Workers bundle |
+| `npm run cf:preview` | Build & preview locally inside Cloudflare `workerd` |
+| `npm run cf:deploy` | Build & deploy to Cloudflare Workers |
+| `npm run db:migrate:local` | Apply `migrations/*.sql` to local D1 |
+| `npm run db:migrate:remote` | Apply `migrations/*.sql` to production D1 |
+| `npm run cf:typegen` | Regenerate `cloudflare-env.d.ts` from `wrangler.jsonc` |

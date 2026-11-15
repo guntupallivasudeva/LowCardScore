@@ -6,24 +6,33 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "cf:build": "opennextjs-cloudflare build",
+    "cf:preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
+    "cf:deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
+    "cf:typegen": "wrangler types --env-interface CloudflareEnv cloudflare-env.d.ts",
+    "db:migrate:local": "wrangler d1 migrations apply lowscore-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply lowscore-db --remote"
   },
   "dependencies": {
-    "next": "^15.2.0",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
+    "@opennextjs/cloudflare": "^1.20.17",
+    "better-auth": "^1.7.25",
+    "canvas-confetti": "^1.9.3",
     "lucide-react": "^0.475.0",
-    "@supabase/supabase-js": "^2.49.1",
-    "canvas-confetti": "^1.9.3"
+    "next": "^15.5.29",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261115.1",
+    "@types/canvas-confetti": "^1.9.0",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "@types/canvas-confetti": "^1.9.0",
     "autoprefixer": "^10.4.20",
     "postcss": "^8.5.0",
     "tailwindcss": "^3.4.17",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "wrangler": "^4.162.0"
   }
 }

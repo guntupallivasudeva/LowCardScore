@@ -1,9 +1,11 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { loadRoomsMap, saveRoomsMap } from '@/lib/serverStore';
+import { NextRequest } from 'next/server';
+import { noStoreJson } from '@/lib/cloudflareDb';
+import { deleteRoom, getRoom, roomExists, saveRoom } from '@/lib/serverStore';
 import {
   createInitialRoom,
   executeDeclare,
   executeMakeMove,
+  generateLobbyCode,
   kickOrRemovePlayer,
   startRound,
   syncBotsInLobby,
@@ -11,56 +13,96 @@ import {
 } from '@/lib/roomController';
 import { computeBotAction, shuffle } from '@/lib/gameEngine';
 
+export const dynamic = 'force-dynamic';
+
+interface RoomRequestBody {
+  action?: string;
+  code?: string;
+  player?: { id: string; name: string; email?: string };
+  payload?: {
+    botsConfig?: { includeAI: boolean; easy: number; hard: number };
+    settings?: {
+      eliminationPoints: number;
+      turnTimer: number;
+      maxPlayers: number;
+      cardsPerPlayer: number;
+    };
+    autoStart?: boolean;
+    name?: string;
+    targetPlayerId?: string;
+    discardIds?: string[];
+    drawFrom?: 'deck' | 'visible';
+    visibleIndex?: number;
+    expectedRound?: number;
+    text?: string;
+  };
+}
+
 export async function GET(req: NextRequest) {
-  const code = req.nextUrl.searchParams.get('code')?.toUpperCase().trim();
-  const playerId = req.nextUrl.searchParams.get('playerId')?.trim();
-  if (!code) {
-    return NextResponse.json({ error: 'Room code is required' }, { status: 400 });
-  }
-  const rooms = loadRoomsMap();
-  const rawRoom = rooms.get(code);
-  if (!rawRoom) {
-    return NextResponse.json({ error: 'Lobby not found' }, { status: 404 });
-  }
-
-  // Clear disconnectedAt if polling player is back online
-  let modified = false;
-  if (playerId) {
-    const p = rawRoom.players.find((pl) => pl.id === playerId);
-    if (p && p.disconnectedAt) {
-      p.disconnectedAt = undefined;
-      modified = true;
+  try {
+    const code = req.nextUrl.searchParams.get('code')?.toUpperCase().trim();
+    const playerId = req.nextUrl.searchParams.get('playerId')?.trim();
+    if (!code) {
+      return noStoreJson({ error: 'Room code is required' }, { status: 400 });
     }
-  }
-
-  const timerCheck = checkRoomTimersAndAutoPlay(rawRoom);
-  if (timerCheck.changed || modified) {
-    if (timerCheck.room) {
-      rooms.set(code, timerCheck.room);
-    } else {
-      rooms.delete(code);
+    const rawRoom = await getRoom(code);
+    if (!rawRoom) {
+      return noStoreJson({ error: 'Lobby not found' }, { status: 404 });
     }
-    saveRoomsMap(rooms);
-  }
 
-  if (!timerCheck.room) {
-    return NextResponse.json({ error: 'Room closed' }, { status: 404 });
-  }
+    // Clear disconnectedAt if polling player is back online
+    let modified = false;
+    if (playerId) {
+      const p = rawRoom.players.find((pl) => pl.id === playerId);
+      if (p && p.disconnectedAt) {
+        p.disconnectedAt = undefined;
+        modified = true;
+      }
+    }
 
-  return NextResponse.json({ room: timerCheck.room });
+    const timerCheck = checkRoomTimersAndAutoPlay(rawRoom);
+    if (timerCheck.changed || modified) {
+      if (timerCheck.room) {
+        await saveRoom(timerCheck.room);
+      } else {
+        await deleteRoom(code);
+      }
+    }
+
+    if (!timerCheck.room) {
+      return noStoreJson({ error: 'Room closed' }, { status: 404 });
+    }
+
+    return noStoreJson({ room: timerCheck.room });
+  } catch (err: unknown) {
+    return noStoreJson(
+      { error: err instanceof Error ? err.message : 'Failed to fetch room' },
+      { status: 500 }
+    );
+  }
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
+    const body = (await req.json()) as RoomRequestBody;
     const { action, code: rawCode, player, payload } = body;
-    const rooms = loadRoomsMap();
 
     if (action === 'create') {
       if (!player?.id || !player?.name) {
-        return NextResponse.json({ error: 'Player info required' }, { status: 400 });
+        return noStoreJson({ error: 'Player info required' }, { status: 400 });
       }
-      let newRoom = createInitialRoom(player, rawCode);
+      let chosenCode = rawCode;
+      if (!chosenCode) {
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const candidate = generateLobbyCode();
+          if (!(await roomExists(candidate))) {
+            chosenCode = candidate;
+            break;
+          }
+        }
+      }
+
+      let newRoom = createInitialRoom(player, chosenCode);
       if (payload?.botsConfig) {
         newRoom.botsConfig = payload.botsConfig;
         newRoom = syncBotsInLobby(newRoom);
@@ -71,40 +113,38 @@ export async function POST(req: NextRequest) {
       if (payload?.autoStart) {
         newRoom = startRound(newRoom, true);
       }
-      rooms.set(newRoom.code, newRoom);
-      saveRoomsMap(rooms);
-      return NextResponse.json({ room: newRoom });
+      await saveRoom(newRoom, { pruneExpired: true });
+      return noStoreJson({ room: newRoom });
     }
 
     const code = (rawCode || '').toUpperCase().trim();
-    const room = rooms.get(code);
+    const room = code ? await getRoom(code) : null;
     if (!room) {
-      return NextResponse.json({ error: `Lobby "${code}" not found.` }, { status: 404 });
+      return noStoreJson({ error: `Lobby "${code}" not found.` }, { status: 404 });
     }
 
     // Join or Rejoin (within 5-min window even if match is playing!)
     if (action === 'join') {
       if (!player?.id || !player?.name) {
-        return NextResponse.json({ error: 'Player info required' }, { status: 400 });
+        return noStoreJson({ error: 'Player info required' }, { status: 400 });
       }
       const alreadyIn = room.players.find((p) => p.id === player.id);
       if (alreadyIn) {
         if (alreadyIn.isKicked) {
-          return NextResponse.json({ error: 'You were kicked from this room.' }, { status: 403 });
+          return noStoreJson({ error: 'You were kicked from this room.' }, { status: 403 });
         }
         alreadyIn.name = player.name;
         alreadyIn.disconnectedAt = undefined;
         room.updatedAt = Date.now();
-        rooms.set(code, room);
-        saveRoomsMap(rooms);
-        return NextResponse.json({ room });
+        await saveRoom(room);
+        return noStoreJson({ room });
       }
 
       if (room.status !== 'lobby') {
-        return NextResponse.json({ error: 'Match has already started in this lobby.' }, { status: 400 });
+        return noStoreJson({ error: 'Match has already started in this lobby.' }, { status: 400 });
       }
       if (room.players.length >= (room.settings.maxPlayers || 8)) {
-        return NextResponse.json(
+        return noStoreJson(
           { error: `Lobby is full (maximum ${room.settings.maxPlayers || 8} players).` },
           { status: 400 }
         );
@@ -124,25 +164,23 @@ export async function POST(req: NextRequest) {
         missedTurns: 0,
       });
       const synced = syncBotsInLobby(room);
-      rooms.set(code, synced);
-      saveRoomsMap(rooms);
-      return NextResponse.json({ room: synced });
+      await saveRoom(synced);
+      return noStoreJson({ room: synced });
     }
 
     // Update player display name anytime
     if (action === 'update_name') {
       const newName = (payload?.name || '').trim();
       if (!newName) {
-        return NextResponse.json({ error: 'Display name cannot be empty' }, { status: 400 });
+        return noStoreJson({ error: 'Display name cannot be empty' }, { status: 400 });
       }
       const target = room.players.find((p) => p.id === player?.id);
       if (target) {
         target.name = newName.slice(0, 24);
         room.updatedAt = Date.now();
-        rooms.set(code, room);
-        saveRoomsMap(rooms);
+        await saveRoom(room);
       }
-      return NextResponse.json({ room });
+      return noStoreJson({ room });
     }
 
     // Temporary leave ("Back") — keeps player seat for 5 minutes while Bot plays their turns
@@ -151,15 +189,14 @@ export async function POST(req: NextRequest) {
       if (target) {
         target.disconnectedAt = Date.now();
         room.updatedAt = Date.now();
-        rooms.set(code, room);
-        saveRoomsMap(rooms);
+        await saveRoom(room);
       }
-      return NextResponse.json({ room });
+      return noStoreJson({ room });
     }
 
     if (action === 'update_settings') {
       if (room.hostId !== player?.id) {
-        return NextResponse.json({ error: 'Only the host can change lobby settings.' }, { status: 403 });
+        return noStoreJson({ error: 'Only the host can change lobby settings.' }, { status: 403 });
       }
       if (payload?.settings) {
         room.settings = {
@@ -177,129 +214,128 @@ export async function POST(req: NextRequest) {
         };
       }
       const synced = syncBotsInLobby(room);
-      rooms.set(code, synced);
-      saveRoomsMap(rooms);
-      return NextResponse.json({ room: synced });
+      await saveRoom(synced);
+      return noStoreJson({ room: synced });
     }
 
     if (action === 'kick') {
       if (room.hostId !== player?.id) {
-        return NextResponse.json({ error: 'Only the host can kick players.' }, { status: 403 });
+        return noStoreJson({ error: 'Only the host can kick players.' }, { status: 403 });
       }
       const targetId = payload?.targetPlayerId;
       if (!targetId || targetId === room.hostId) {
-        return NextResponse.json({ error: 'Invalid player to kick.' }, { status: 400 });
+        return noStoreJson({ error: 'Invalid player to kick.' }, { status: 400 });
       }
       const updated = kickOrRemovePlayer(room, targetId);
       if (!updated) {
-        rooms.delete(code);
-        saveRoomsMap(rooms);
-        return NextResponse.json({ room: null });
+        await deleteRoom(code);
+        return noStoreJson({ room: null });
       }
-      rooms.set(code, updated);
-      saveRoomsMap(rooms);
-      return NextResponse.json({ room: updated });
+      await saveRoom(updated);
+      return noStoreJson({ room: updated });
     }
 
     if (action === 'leave') {
-      const updated = kickOrRemovePlayer(room, player?.id, true);
-      if (!updated) {
-        rooms.delete(code);
-        saveRoomsMap(rooms);
-        return NextResponse.json({ room: null });
+      if (!player?.id) {
+        return noStoreJson({ error: 'Player info required' }, { status: 400 });
       }
-      rooms.set(code, updated);
-      saveRoomsMap(rooms);
-      return NextResponse.json({ room: updated });
+      const updated = kickOrRemovePlayer(room, player.id, true);
+      if (!updated) {
+        await deleteRoom(code);
+        return noStoreJson({ room: null });
+      }
+      await saveRoom(updated);
+      return noStoreJson({ room: updated });
     }
 
     if (action === 'start_game') {
       if (room.hostId !== player?.id) {
-        return NextResponse.json({ error: 'Only the host can start the match.' }, { status: 403 });
+        return noStoreJson({ error: 'Only the host can start the match.' }, { status: 403 });
       }
       if (room.players.length < 2) {
-        return NextResponse.json(
+        return noStoreJson(
           { error: 'At least 2 players are required to start (invite a friend or enable AI bots).' },
           { status: 400 }
         );
       }
       room.roundNumber = 1;
       const started = startRound(room, true);
-      rooms.set(code, started);
-      saveRoomsMap(rooms);
-      return NextResponse.json({ room: started });
+      await saveRoom(started);
+      return noStoreJson({ room: started });
     }
 
     if (action === 'make_move') {
+      if (!player?.id) {
+        return noStoreJson({ error: 'Player info required' }, { status: 400 });
+      }
       const { discardIds, drawFrom, visibleIndex } = payload || {};
       if (!drawFrom) {
-        return NextResponse.json({ error: 'Please select a card to draw from the Deck or Open Pile.' }, { status: 400 });
+        return noStoreJson({ error: 'Please select a card to draw from the Deck or Open Pile.' }, { status: 400 });
       }
       const result = executeMakeMove(
         room,
-        player?.id,
+        player.id,
         discardIds || [],
         drawFrom,
         visibleIndex || 0,
         false
       );
       if (result.error) {
-        return NextResponse.json({ error: result.error }, { status: 400 });
+        return noStoreJson({ error: result.error }, { status: 400 });
       }
-      rooms.set(code, result.room);
-      saveRoomsMap(rooms);
-      return NextResponse.json({ room: result.room });
+      await saveRoom(result.room);
+      return noStoreJson({ room: result.room });
     }
 
     if (action === 'declare') {
-      const result = executeDeclare(room, player?.id);
-      if (result.error) {
-        return NextResponse.json({ error: result.error }, { status: 400 });
+      if (!player?.id) {
+        return noStoreJson({ error: 'Player info required' }, { status: 400 });
       }
-      rooms.set(code, result.room);
-      saveRoomsMap(rooms);
-      return NextResponse.json({ room: result.room });
+      const result = executeDeclare(room, player.id);
+      if (result.error) {
+        return noStoreJson({ error: result.error }, { status: 400 });
+      }
+      await saveRoom(result.room);
+      return noStoreJson({ room: result.room });
     }
 
     if (action === 'shuffle_deck') {
       if (room.status !== 'playing') {
-        return NextResponse.json({ error: 'Game is not currently active.' }, { status: 400 });
+        return noStoreJson({ error: 'Game is not currently active.' }, { status: 400 });
       }
       if (room.currentTurnPlayerId !== player?.id) {
-        return NextResponse.json(
+        return noStoreJson(
           { error: 'Only the active turn player can shuffle the draw deck.' },
           { status: 403 }
         );
       }
       room.deck = shuffle(room.deck);
       room.updatedAt = Date.now();
-      rooms.set(code, room);
-      saveRoomsMap(rooms);
-      return NextResponse.json({ room });
+      await saveRoom(room);
+      return noStoreJson({ room });
     }
 
     if (action === 'bot_turn' || action === 'timeout_turn') {
       if (room.status !== 'playing') {
-        return NextResponse.json({ room });
+        return noStoreJson({ room });
       }
       const currentPlayer = room.players.find((p) => p.id === room.currentTurnPlayerId);
       if (!currentPlayer) {
-        return NextResponse.json({ room });
+        return noStoreJson({ room });
       }
 
       const isTimeoutHuman = action === 'timeout_turn' && !currentPlayer.isBot;
       const isBotOrOffline = currentPlayer.isBot || Boolean(currentPlayer.disconnectedAt);
 
       if (!isBotOrOffline && !isTimeoutHuman) {
-        return NextResponse.json({ room });
+        return noStoreJson({ room });
       }
 
       const decision = computeBotAction(room, currentPlayer);
       if (decision.action === 'declare' && isBotOrOffline) {
         const declRes = executeDeclare(room, currentPlayer.id);
-        rooms.set(code, declRes.room);
-        saveRoomsMap(rooms);
-        return NextResponse.json({ room: declRes.room });
+        await saveRoom(declRes.room);
+        return noStoreJson({ room: declRes.room });
       } else {
         const moveRes = executeMakeMove(
           room,
@@ -309,35 +345,32 @@ export async function POST(req: NextRequest) {
           decision.visibleIndex || 0,
           isTimeoutHuman
         );
-        rooms.set(code, moveRes.room);
-        saveRoomsMap(rooms);
-        return NextResponse.json({ room: moveRes.room });
+        await saveRoom(moveRes.room);
+        return noStoreJson({ room: moveRes.room });
       }
     }
 
     if (action === 'next_round') {
       if (room.status !== 'round_end') {
-        return NextResponse.json({ room });
+        return noStoreJson({ room });
       }
       if (
         typeof payload?.expectedRound === 'number' &&
         payload.expectedRound !== room.roundNumber
       ) {
-        return NextResponse.json({ room });
+        return noStoreJson({ room });
       }
       room.roundNumber += 1;
       const nextR = startRound(room, false);
-      rooms.set(code, nextR);
-      saveRoomsMap(rooms);
-      return NextResponse.json({ room: nextR });
+      await saveRoom(nextR);
+      return noStoreJson({ room: nextR });
     }
 
     if (action === 'play_again') {
       room.roundNumber = 1;
       const restarted = startRound(room, true);
-      rooms.set(code, restarted);
-      saveRoomsMap(rooms);
-      return NextResponse.json({ room: restarted });
+      await saveRoom(restarted);
+      return noStoreJson({ room: restarted });
     }
 
     if (action === 'return_to_lobby') {
@@ -365,9 +398,8 @@ export async function POST(req: NextRequest) {
         winnerId: undefined,
         updatedAt: Date.now(),
       };
-      rooms.set(code, lobbyRoom);
-      saveRoomsMap(rooms);
-      return NextResponse.json({ room: lobbyRoom });
+      await saveRoom(lobbyRoom);
+      return noStoreJson({ room: lobbyRoom });
     }
 
     if (action === 'chat') {
@@ -384,15 +416,14 @@ export async function POST(req: NextRequest) {
           room.chat = room.chat.slice(-50);
         }
         room.updatedAt = Date.now();
-        rooms.set(code, room);
-        saveRoomsMap(rooms);
+        await saveRoom(room);
       }
-      return NextResponse.json({ room });
+      return noStoreJson({ room });
     }
 
-    return NextResponse.json({ error: 'Unknown action' }, { status: 400 });
+    return noStoreJson({ error: 'Unknown action' }, { status: 400 });
   } catch (err: unknown) {
-    return NextResponse.json(
+    return noStoreJson(
       { error: err instanceof Error ? err.message : 'Room operation failed' },
       { status: 500 }
     );

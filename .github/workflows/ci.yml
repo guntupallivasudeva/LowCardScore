@@ -1,4 +1,4 @@
-name: CI
+name: CI & Deploy (Cloudflare Workers)
 
 on:
   push:
@@ -8,8 +8,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  quality:
-    name: Type Check, Build & Security Audit
+  quality-and-deploy:
+    name: Type Check, OpenNext Build & Cloudflare Deploy
     runs-on: ubuntu-latest
 
     steps:
@@ -25,12 +25,38 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Production build
-        run: npm run build
-
       - name: Type check
         run: npx tsc --noEmit
+
+      - name: Build OpenNext Cloudflare Worker
+        run: npm run cf:build
+
+      - name: Validate Wrangler deployment bundle (dry-run)
+        run: npx wrangler deploy --dry-run --outdir /tmp/wrangler-dry-run && rm -rf /tmp/wrangler-dry-run
 
       - name: Dependency security audit
         continue-on-error: true
         run: npm audit --audit-level=high
+
+      - name: Deploy to Cloudflare Workers (when secrets are configured)
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          BETTER_AUTH_SECRET_VALUE: ${{ secrets.BETTER_AUTH_SECRET }}
+          BETTER_AUTH_URL_VALUE: ${{ secrets.BETTER_AUTH_URL }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "Skipping Cloudflare deploy: add CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID repository secrets to enable automatic deployment on main."
+            exit 0
+          fi
+
+          npx wrangler d1 migrations apply lowscore-db --remote
+          npx opennextjs-cloudflare deploy
+
+          if [ -n "$BETTER_AUTH_SECRET_VALUE" ]; then
+            printf '%s' "$BETTER_AUTH_SECRET_VALUE" | npx wrangler secret put BETTER_AUTH_SECRET
+          fi
+          if [ -n "$BETTER_AUTH_URL_VALUE" ]; then
+            printf '%s' "$BETTER_AUTH_URL_VALUE" | npx wrangler secret put BETTER_AUTH_URL
+          fi

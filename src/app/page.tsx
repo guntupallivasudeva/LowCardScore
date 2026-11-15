@@ -6,6 +6,8 @@ import { LobbyView } from '@/components/LobbyView';
 import { GameTable } from '@/components/GameTable';
 import { PlayingCard } from '@/components/PlayingCard';
 import { LowScoreLogo } from '@/components/LowScoreLogo';
+import { FireSuitLoader } from '@/components/FireSuitLoader';
+import { authClient } from '@/lib/auth-client';
 import { soundFX } from '@/lib/soundEffects';
 import {
   Users,
@@ -33,9 +35,52 @@ interface UserSession {
   isGuest?: boolean;
 }
 
-const STORAGE_USER_KEY = 'leastscore_user_session_v1';
-const STORAGE_ACTIVE_ROOM_KEY = 'leastscore_active_room_v1';
-const STORAGE_REJOIN_ROOM_KEY = 'leastscore_rejoin_room_v1';
+const STORAGE_USER_KEY = 'lowscore_user_session_v1';
+const STORAGE_ACTIVE_ROOM_KEY = 'lowscore_active_room_v1';
+const STORAGE_REJOIN_ROOM_KEY = 'lowscore_rejoin_room_v1';
+const LEGACY_USER_KEY = 'leastscore_user_session_v1';
+const LEGACY_ACTIVE_ROOM_KEY = 'leastscore_active_room_v1';
+const LEGACY_REJOIN_ROOM_KEY = 'leastscore_rejoin_room_v1';
+
+function readStorageWithLegacy(primary: string, legacy: string): string | null {
+  try {
+    const val = localStorage.getItem(primary);
+    if (val !== null) return val;
+    const oldVal = localStorage.getItem(legacy);
+    if (oldVal !== null) {
+      localStorage.setItem(primary, oldVal);
+      localStorage.removeItem(legacy);
+      return oldVal;
+    }
+  } catch {
+    // ignore storage access issues
+  }
+  return null;
+}
+
+function writeActiveRoomCode(code: string | null) {
+  try {
+    if (code) {
+      localStorage.setItem(STORAGE_ACTIVE_ROOM_KEY, code);
+      localStorage.removeItem(LEGACY_ACTIVE_ROOM_KEY);
+    } else {
+      localStorage.removeItem(STORAGE_ACTIVE_ROOM_KEY);
+      localStorage.removeItem(LEGACY_ACTIVE_ROOM_KEY);
+    }
+  } catch {
+    // ignore
+  }
+  if (typeof window !== 'undefined') {
+    const url = new URL(window.location.href);
+    if (code) {
+      url.searchParams.set('room', code);
+      url.searchParams.delete('join');
+    } else {
+      url.searchParams.delete('room');
+    }
+    window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+  }
+}
 
 interface RejoinInfo {
   code: string;
@@ -45,6 +90,7 @@ interface RejoinInfo {
 export default function LeastScoreApp() {
   const [user, setUser] = useState<UserSession | null>(null);
   const [authLoaded, setAuthLoaded] = useState(false);
+  const [reconnectingCode, setReconnectingCode] = useState<string | null>(null);
 
   // Auth form states
   const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
@@ -70,43 +116,133 @@ export default function LeastScoreApp() {
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
 
   const botTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const reconnectAttemptedRef = useRef<boolean>(false);
 
-  // 1. Load saved user session, sound preference & active/rejoin room from localStorage on mount
+  // 1. Hydrate Better Auth cookie session (or saved Guest session), D1 preferences & rejoin state on mount
   useEffect(() => {
-    try {
-      let loadedUserId: string | undefined;
-      const savedUser = localStorage.getItem(STORAGE_USER_KEY);
-      if (savedUser) {
-        const parsed = JSON.parse(savedUser) as UserSession;
-        if (parsed?.id && parsed?.name) {
-          setUser(parsed);
-          loadedUserId = parsed.id;
-          if (typeof parsed.soundEnabled === 'boolean') {
-            soundFX.savePreference(parsed.soundEnabled, parsed.id);
+    let cancelled = false;
+
+    const hydrate = async () => {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const urlJoin = params.get('join');
+        const urlRoom = params.get('room');
+        if (urlJoin) {
+          setJoinCodeInput(urlJoin.toUpperCase().slice(0, 5));
+        }
+
+        const savedRoomCode = (
+          urlRoom ||
+          readStorageWithLegacy(STORAGE_ACTIVE_ROOM_KEY, LEGACY_ACTIVE_ROOM_KEY) ||
+          ''
+        )
+          .trim()
+          .toUpperCase();
+
+        const savedRejoin = readStorageWithLegacy(STORAGE_REJOIN_ROOM_KEY, LEGACY_REJOIN_ROOM_KEY);
+        if (savedRejoin) {
+          const parsedRejoin = JSON.parse(savedRejoin) as RejoinInfo;
+          if (Date.now() - parsedRejoin.leftAt < 5 * 60 * 1000) {
+            setRejoinInfo(parsedRejoin);
+          } else {
+            localStorage.removeItem(STORAGE_REJOIN_ROOM_KEY);
+            localStorage.removeItem(LEGACY_REJOIN_ROOM_KEY);
           }
         }
-      }
-      const pref = soundFX.loadPreference(loadedUserId);
-      setSoundEnabled(pref);
-      const savedRejoin = localStorage.getItem(STORAGE_REJOIN_ROOM_KEY);
-      if (savedRejoin) {
-        const parsedRejoin = JSON.parse(savedRejoin) as RejoinInfo;
-        if (Date.now() - parsedRejoin.leftAt < 5 * 60 * 1000) {
-          setRejoinInfo(parsedRejoin);
+
+        const savedRaw = readStorageWithLegacy(STORAGE_USER_KEY, LEGACY_USER_KEY);
+        let parsedSaved: UserSession | null = null;
+        if (savedRaw) {
+          try {
+            const p = JSON.parse(savedRaw) as UserSession;
+            if (p?.id && p?.name) parsedSaved = p;
+          } catch {
+            // ignore corrupted json
+          }
+        }
+
+        let resolvedUser: UserSession | null = null;
+        try {
+          const sessionRes = await authClient.getSession();
+          const sessionUser = sessionRes?.data?.user as
+            | { id: string; email: string; name: string; soundEnabled?: boolean }
+            | undefined;
+
+          if (sessionUser?.id && sessionUser?.email) {
+            let remoteSound =
+              typeof sessionUser.soundEnabled === 'boolean' ? sessionUser.soundEnabled : undefined;
+            try {
+              const prefRes = await fetch(
+                `/api/preferences?userId=${encodeURIComponent(sessionUser.id)}`,
+                { cache: 'no-store' }
+              );
+              if (prefRes.ok) {
+                const prefJson = (await prefRes.json()) as {
+                  preferences?: { soundEnabled?: boolean };
+                };
+                if (typeof prefJson?.preferences?.soundEnabled === 'boolean') {
+                  remoteSound = prefJson.preferences.soundEnabled;
+                }
+              }
+            } catch {
+              // ignore transient pref fetch error
+            }
+            const hasLocalPref =
+              localStorage.getItem(`lowscore_sound_pref_${sessionUser.id}`) !== null ||
+              localStorage.getItem(`leastscore_sound_pref_${sessionUser.id}`) !== null;
+            const finalSound = hasLocalPref
+              ? soundFX.loadPreference(sessionUser.id)
+              : remoteSound ?? soundFX.loadPreference();
+
+            resolvedUser = {
+              id: sessionUser.id,
+              email: sessionUser.email,
+              name: sessionUser.name || sessionUser.email.split('@')[0],
+              soundEnabled: finalSound,
+              isGuest: false,
+            };
+          } else if (parsedSaved?.isGuest) {
+            resolvedUser = parsedSaved;
+          } else {
+            localStorage.removeItem(STORAGE_USER_KEY);
+          }
+        } catch {
+          if (parsedSaved) {
+            resolvedUser = parsedSaved;
+          }
+        }
+
+        if (cancelled) return;
+
+        if (resolvedUser) {
+          if (typeof resolvedUser.soundEnabled === 'boolean') {
+            soundFX.savePreference(resolvedUser.soundEnabled, resolvedUser.id);
+          }
+          const finalPref = soundFX.loadPreference(resolvedUser.id);
+          resolvedUser = { ...resolvedUser, soundEnabled: finalPref };
+          localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(resolvedUser));
+          setUser(resolvedUser);
+          setSoundEnabled(finalPref);
+
+          if (savedRoomCode && savedRoomCode.length >= 4) {
+            setReconnectingCode(savedRoomCode);
+          }
         } else {
-          localStorage.removeItem(STORAGE_REJOIN_ROOM_KEY);
+          setSoundEnabled(soundFX.loadPreference());
+        }
+      } catch {
+        // ignore startup hydration errors
+      } finally {
+        if (!cancelled) {
+          setAuthLoaded(true);
         }
       }
-      const params = new URLSearchParams(window.location.search);
-      const urlJoin = params.get('join');
-      if (urlJoin) {
-        setJoinCodeInput(urlJoin.toUpperCase().slice(0, 5));
-      }
-    } catch {
-      // ignore localStorage read errors
-    } finally {
-      setAuthLoaded(true);
-    }
+    };
+
+    hydrate();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Rejoin countdown timer on Dashboard (5 minutes = 300s)
@@ -119,6 +255,7 @@ export default function LeastScoreApp() {
       if (rem === 0) {
         setRejoinInfo(null);
         localStorage.removeItem(STORAGE_REJOIN_ROOM_KEY);
+        localStorage.removeItem(LEGACY_REJOIN_ROOM_KEY);
       }
     };
     tick();
@@ -126,48 +263,72 @@ export default function LeastScoreApp() {
     return () => clearInterval(timer);
   }, [rejoinInfo]);
 
-  // Reconnect to active room if saved in localStorage (and user did not click "Back" to step away)
+  // Reconnect to active room on page refresh (keeps player seamlessly inside the game)
   useEffect(() => {
-    if (!user) return;
-    const savedCode = localStorage.getItem(STORAGE_ACTIVE_ROOM_KEY);
-    if (savedCode && !room) {
-      fetch(`/api/room?code=${encodeURIComponent(savedCode)}&playerId=${encodeURIComponent(user.id)}`)
-        .then((r) => (r.ok ? r.json() : null))
-        .then((data) => {
-          if (data?.room) {
-            const stillInRoom = data.room.players.some((p: { id: string }) => p.id === user.id);
-            if (stillInRoom) {
-              setRoom(data.room);
-            } else {
-              localStorage.removeItem(STORAGE_ACTIVE_ROOM_KEY);
-            }
-          } else {
-            localStorage.removeItem(STORAGE_ACTIVE_ROOM_KEY);
-          }
-        })
-        .catch(() => {});
+    if (!user || room || reconnectAttemptedRef.current) return;
+    const params = new URLSearchParams(window.location.search);
+    const savedCode = (
+      params.get('room') ||
+      readStorageWithLegacy(STORAGE_ACTIVE_ROOM_KEY, LEGACY_ACTIVE_ROOM_KEY) ||
+      ''
+    )
+      .trim()
+      .toUpperCase();
+
+    if (!savedCode || savedCode.length < 4) {
+      setReconnectingCode(null);
+      return;
     }
+
+    reconnectAttemptedRef.current = true;
+    setReconnectingCode(savedCode);
+
+    fetch(
+      `/api/room?code=${encodeURIComponent(savedCode)}&playerId=${encodeURIComponent(user.id)}`,
+      { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } }
+    )
+      .then((r) => (r.ok ? (r.json() as Promise<{ room?: RoomState }>) : null))
+      .then((data) => {
+        if (data?.room) {
+          const mySeat = data.room.players.find(
+            (p: { id: string; isKicked?: boolean }) => p.id === user.id
+          );
+          if (mySeat && !mySeat.isKicked) {
+            setRoom(data.room);
+            writeActiveRoomCode(data.room.code);
+            return;
+          }
+        }
+        writeActiveRoomCode(null);
+      })
+      .catch(() => {
+        writeActiveRoomCode(null);
+      })
+      .finally(() => {
+        setReconnectingCode(null);
+      });
   }, [user, room]);
 
   // 2. Poll active room state for realtime multiplayer synchronization
   const fetchRoomUpdate = useCallback(async (code: string, currentUserId: string) => {
     try {
       const res = await fetch(
-        `/api/room?code=${encodeURIComponent(code)}&playerId=${encodeURIComponent(currentUserId)}`
+        `/api/room?code=${encodeURIComponent(code)}&playerId=${encodeURIComponent(currentUserId)}`,
+        { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } }
       );
       if (!res.ok) {
         if (res.status === 404) {
           setRoom(null);
-          localStorage.removeItem(STORAGE_ACTIVE_ROOM_KEY);
+          writeActiveRoomCode(null);
         }
         return;
       }
-      const data = await res.json();
+      const data = (await res.json()) as { room?: RoomState };
       if (data?.room) {
         const myEntry = data.room.players.find((p: { id: string }) => p.id === currentUserId);
         if (!myEntry || myEntry.isKicked) {
           setRoom(null);
-          localStorage.removeItem(STORAGE_ACTIVE_ROOM_KEY);
+          writeActiveRoomCode(null);
           setDashboardError(
             myEntry?.isKicked ? 'You were kicked from the room.' : 'You were removed from the room.'
           );
@@ -192,7 +353,10 @@ export default function LeastScoreApp() {
   useEffect(() => {
     if (room || !rejoinInfo) return;
     const interval = setInterval(() => {
-      fetch(`/api/room?code=${encodeURIComponent(rejoinInfo.code)}`).catch(() => {});
+      fetch(`/api/room?code=${encodeURIComponent(rejoinInfo.code)}`, {
+        cache: 'no-store',
+        headers: { 'Cache-Control': 'no-cache' },
+      }).catch(() => {});
     }, 1800);
     return () => clearInterval(interval);
   }, [room, rejoinInfo]);
@@ -207,7 +371,8 @@ export default function LeastScoreApp() {
         try {
           const res = await fetch('/api/room', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            cache: 'no-store',
+            headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
             body: JSON.stringify({
               action: 'bot_turn',
               code: room.code,
@@ -215,7 +380,7 @@ export default function LeastScoreApp() {
             }),
           });
           if (res.ok) {
-            const data = await res.json();
+            const data = (await res.json()) as { room?: RoomState };
             if (data.room) setRoom(data.room);
           }
         } catch {
@@ -228,41 +393,94 @@ export default function LeastScoreApp() {
     };
   }, [room, user]);
 
-  // Auth Handlers
+  // Better Auth Handlers (Cloudflare D1 backed)
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError(null);
     setAuthSubmitting(true);
     try {
-      const res = await fetch('/api/auth', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: authMode,
-          email,
-          password,
-          name: displayName,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setAuthError(data.error || 'Authentication failed');
+      const cleanEmail = email.trim().toLowerCase();
+      const chosenName = displayName.trim() || cleanEmail.split('@')[0] || 'Player';
+      const localDefaultSound = soundFX.loadPreference();
+
+      const authRes =
+        authMode === 'signup'
+          ? await authClient.signUp.email({
+              email: cleanEmail,
+              password,
+              name: chosenName,
+              soundEnabled: localDefaultSound,
+            } as Parameters<typeof authClient.signUp.email>[0])
+          : await authClient.signIn.email({
+              email: cleanEmail,
+              password,
+            });
+
+      if (authRes.error) {
+        setAuthError(authRes.error.message || 'Authentication failed');
         return;
       }
-      if (data.user) {
+
+      const signedUser = authRes.data?.user as
+        | { id: string; email: string; name: string; soundEnabled?: boolean }
+        | undefined;
+
+      if (signedUser?.id) {
+        let remoteSound =
+          typeof signedUser.soundEnabled === 'boolean' ? signedUser.soundEnabled : undefined;
+        try {
+          if (authMode === 'signup') {
+            await fetch('/api/preferences', {
+              method: 'POST',
+              cache: 'no-store',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                userId: signedUser.id,
+                name: signedUser.name || chosenName,
+                soundEnabled: localDefaultSound,
+              }),
+            });
+            remoteSound = localDefaultSound;
+          } else {
+            const prefRes = await fetch(
+              `/api/preferences?userId=${encodeURIComponent(signedUser.id)}`,
+              { cache: 'no-store' }
+            );
+            if (prefRes.ok) {
+              const prefJson = (await prefRes.json()) as {
+                preferences?: { soundEnabled?: boolean };
+              };
+              if (typeof prefJson?.preferences?.soundEnabled === 'boolean') {
+                remoteSound = prefJson.preferences.soundEnabled;
+              }
+            }
+          }
+        } catch {
+          // ignore transient D1 pref sync error
+        }
+
         const hasLocalUserPref =
-          localStorage.getItem(`leastscore_sound_pref_${data.user.id}`) !== null;
+          localStorage.getItem(`lowscore_sound_pref_${signedUser.id}`) !== null ||
+          localStorage.getItem(`leastscore_sound_pref_${signedUser.id}`) !== null;
         const resolvedSound = hasLocalUserPref
-          ? soundFX.loadPreference(data.user.id)
-          : data.user.soundEnabled ?? soundFX.loadPreference();
-        const sessionUser: UserSession = { ...data.user, soundEnabled: resolvedSound };
+          ? soundFX.loadPreference(signedUser.id)
+          : remoteSound ?? localDefaultSound;
+
+        const sessionUser: UserSession = {
+          id: signedUser.id,
+          email: signedUser.email,
+          name: signedUser.name || chosenName,
+          soundEnabled: resolvedSound,
+          isGuest: false,
+        };
         soundFX.savePreference(resolvedSound, sessionUser.id);
         setSoundEnabled(resolvedSound);
         localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(sessionUser));
+        reconnectAttemptedRef.current = false;
         setUser(sessionUser);
       }
     } catch {
-      setAuthError('Network error while connecting to authentication service.');
+      setAuthError('Network error while connecting to Better Auth service.');
     } finally {
       setAuthSubmitting(false);
     }
@@ -280,6 +498,7 @@ export default function LeastScoreApp() {
     };
     soundFX.savePreference(currentPref, guestUser.id);
     localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(guestUser));
+    reconnectAttemptedRef.current = false;
     setUser(guestUser);
   };
 
@@ -295,24 +514,31 @@ export default function LeastScoreApp() {
       } catch {
         // ignore localStorage errors
       }
-      if (!user.isGuest && user.email) {
-        fetch('/api/auth', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            action: 'preferences',
-            email: user.email,
-            soundEnabled: next,
-          }),
-        }).catch(() => {});
-      }
+      fetch('/api/preferences', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: user.id,
+          soundEnabled: next,
+        }),
+      }).catch(() => {});
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    try {
+      await authClient.signOut();
+    } catch {
+      // ignore signOut network error
+    }
     localStorage.removeItem(STORAGE_USER_KEY);
-    localStorage.removeItem(STORAGE_ACTIVE_ROOM_KEY);
+    localStorage.removeItem(LEGACY_USER_KEY);
     localStorage.removeItem(STORAGE_REJOIN_ROOM_KEY);
+    localStorage.removeItem(LEGACY_REJOIN_ROOM_KEY);
+    writeActiveRoomCode(null);
+    reconnectAttemptedRef.current = false;
+    setReconnectingCode(null);
     setRoom(null);
     setRejoinInfo(null);
     setUser(null);
@@ -325,6 +551,13 @@ export default function LeastScoreApp() {
     const updatedUser: UserSession = { ...user, name: cleaned };
     setUser(updatedUser);
     localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(updatedUser));
+
+    fetch('/api/preferences', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userId: user.id, name: cleaned }),
+    }).catch(() => {});
 
     if (room) {
       await callRoomApi('update_name', { name: cleaned });
@@ -341,7 +574,8 @@ export default function LeastScoreApp() {
     const targetCode = customCode || room?.code;
     const res = await fetch('/api/room', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' },
       body: JSON.stringify({
         action,
         code: targetCode,
@@ -349,7 +583,7 @@ export default function LeastScoreApp() {
         payload,
       }),
     });
-    const data = await res.json();
+    const data = (await res.json()) as { room?: RoomState | null; error?: string };
     if (!res.ok) {
       throw new Error(data.error || 'Operation failed');
     }
@@ -360,19 +594,20 @@ export default function LeastScoreApp() {
         setRejoinInfo(info);
         localStorage.setItem(STORAGE_REJOIN_ROOM_KEY, JSON.stringify(info));
       }
-      localStorage.removeItem(STORAGE_ACTIVE_ROOM_KEY);
+      writeActiveRoomCode(null);
       setRoom(null);
       return;
     }
 
     if (data.room) {
       setRoom(data.room);
-      localStorage.setItem(STORAGE_ACTIVE_ROOM_KEY, data.room.code);
+      writeActiveRoomCode(data.room.code);
       setRejoinInfo(null);
       localStorage.removeItem(STORAGE_REJOIN_ROOM_KEY);
+      localStorage.removeItem(LEGACY_REJOIN_ROOM_KEY);
     } else {
       setRoom(null);
-      localStorage.removeItem(STORAGE_ACTIVE_ROOM_KEY);
+      writeActiveRoomCode(null);
     }
   };
 
@@ -440,11 +675,21 @@ export default function LeastScoreApp() {
     }
   };
 
-  if (!authLoaded) {
+  if (!authLoaded || (user && !room && reconnectingCode)) {
     return (
-      <div className="min-h-screen bg-[#FAF9F5] flex flex-col items-center justify-center gap-2.5 text-stone-500 text-sm">
-        <LowScoreLogo className="w-9 h-9 animate-pulse" />
-        <span>Loading LowScore...</span>
+      <div className="min-h-screen bg-[#FAF9F5] flex flex-col items-center justify-center p-6">
+        <FireSuitLoader
+          label={
+            reconnectingCode
+              ? `Reconnecting to Table ${reconnectingCode}...`
+              : 'Loading LowScore...'
+          }
+          sublabel={
+            reconnectingCode
+              ? 'Keeping your active hand, turn timer & table intact'
+              : 'Warming the deck & Cloudflare D1 session'
+          }
+        />
       </div>
     );
   }
@@ -602,7 +847,7 @@ export default function LeastScoreApp() {
 
           <p className="text-[11px] text-stone-400 text-center flex items-center justify-center gap-1">
             <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-            Session persists automatically in localStorage
+            Secured by Better Auth &amp; Cloudflare D1 · Guest mode supported
           </p>
         </div>
       </div>
@@ -1015,6 +1260,18 @@ export default function LeastScoreApp() {
                 Got It
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Table Launch / Join Loading Overlay */}
+      {loadingAction && (
+        <div className="fixed inset-0 bg-stone-900/45 backdrop-blur-xs z-50 flex items-center justify-center p-4">
+          <div className="bg-[#FAF9F5] border border-stone-200 rounded-2xl px-8 py-6 shadow-2xl">
+            <FireSuitLoader
+              label="Setting Up Table..."
+              sublabel="Syncing cards & players in Cloudflare D1"
+            />
           </div>
         </div>
       )}

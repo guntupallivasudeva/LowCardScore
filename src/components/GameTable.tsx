@@ -132,6 +132,41 @@ function PlayerRoundsStrip({
   );
 }
 
+interface PersistedTableUiState {
+  autoPlay?: boolean;
+  showScoreboard?: boolean;
+  showChat?: boolean;
+  dismissedRoundModal?: boolean;
+  dismissedRoundNumber?: number;
+  selectedCardIds?: string[];
+  drawSource?: 'deck' | 'visible' | null;
+  selectedVisibleIdx?: number;
+  turnKey?: string;
+}
+
+function getTableUiStorageKey(roomCode: string, userId: string): string {
+  return `lowscore_table_ui_${roomCode}_${userId}`;
+}
+
+function getDealtRoundStorageKey(roomCode: string, userId: string): string {
+  return `lowscore_dealt_round_${roomCode}_${userId}`;
+}
+
+function loadInitialTableUi(roomCode: string, userId: string): PersistedTableUiState {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw =
+      sessionStorage.getItem(getTableUiStorageKey(roomCode, userId)) ||
+      localStorage.getItem(getTableUiStorageKey(roomCode, userId));
+    if (raw) {
+      return JSON.parse(raw) as PersistedTableUiState;
+    }
+  } catch {
+    // ignore storage read errors
+  }
+  return {};
+}
+
 export function GameTable({
   room,
   currentUser,
@@ -150,19 +185,40 @@ export function GameTable({
   onReturnToLobby,
   onSendChat,
 }: GameTableProps) {
+  const me = room.players.find((p) => p.id === currentUser.id) || room.players[0];
+  const initialTurnKey = `${room.roundNumber}:${room.turnsPlayedInRound}:${room.currentTurnPlayerId}`;
+  const initialUiRef = useRef<PersistedTableUiState | null>(null);
+  if (initialUiRef.current === null) {
+    initialUiRef.current = loadInitialTableUi(room.code, currentUser.id);
+  }
+  const initialUi = initialUiRef.current;
+  const initialValidHandIds = new Set(me.hand.map((c) => c.id));
+  const sameInitialTurn = initialUi.turnKey === initialTurnKey;
+
   // Player can pre-select their own hand cards even when it is not their turn!
-  const [selectedCardIds, setSelectedCardIds] = useState<string[]>([]);
-  const [drawSource, setDrawSource] = useState<'deck' | 'visible' | null>(null);
-  const [selectedVisibleIdx, setSelectedVisibleIdx] = useState<number>(0);
-  const [autoPlay, setAutoPlay] = useState<boolean>(false);
+  const [selectedCardIds, setSelectedCardIds] = useState<string[]>(() =>
+    Array.isArray(initialUi.selectedCardIds)
+      ? initialUi.selectedCardIds.filter((id) => initialValidHandIds.has(id))
+      : []
+  );
+  const [drawSource, setDrawSource] = useState<'deck' | 'visible' | null>(() =>
+    sameInitialTurn ? (initialUi.drawSource ?? null) : null
+  );
+  const [selectedVisibleIdx, setSelectedVisibleIdx] = useState<number>(() => {
+    if (!sameInitialTurn || typeof initialUi.selectedVisibleIdx !== 'number') return 0;
+    return Math.max(0, Math.min(Math.max(0, room.visibleCards.length - 1), initialUi.selectedVisibleIdx));
+  });
+  const [autoPlay, setAutoPlay] = useState<boolean>(() => Boolean(initialUi.autoPlay));
 
   const [isShufflingDeck, setIsShufflingDeck] = useState<boolean>(false);
   const [isDealingRound, setIsDealingRound] = useState<boolean>(false);
   const [revealedCardCount, setRevealedCardCount] = useState<number>(99);
 
   const [hintText, setHintText] = useState<string | null>(null);
-  const [showScoreboard, setShowScoreboard] = useState<boolean>(true);
-  const [showChat, setShowChat] = useState<boolean>(false);
+  const [showScoreboard, setShowScoreboard] = useState<boolean>(() =>
+    typeof initialUi.showScoreboard === 'boolean' ? initialUi.showScoreboard : true
+  );
+  const [showChat, setShowChat] = useState<boolean>(() => Boolean(initialUi.showChat));
 
   // Confirmation Modals for Declare, Exit, and Kick
   const [showDeclareModal, setShowDeclareModal] = useState<boolean>(false);
@@ -171,7 +227,11 @@ export function GameTable({
     null
   );
 
-  const [dismissedRoundModal, setDismissedRoundModal] = useState<boolean>(false);
+  const [dismissedRoundModal, setDismissedRoundModal] = useState<boolean>(() =>
+    Boolean(
+      initialUi.dismissedRoundModal && initialUi.dismissedRoundNumber === room.roundNumber
+    )
+  );
   const [copiedCode, setCopiedCode] = useState<boolean>(false);
   const [chatInput, setChatInput] = useState<string>('');
   const [submitting, setSubmitting] = useState<boolean>(false);
@@ -192,11 +252,45 @@ export function GameTable({
   const nextRoundTriggeredRef = useRef<number | null>(null);
   const lastSummaryEndedAtRef = useRef<number | null>(null);
 
-  const me = room.players.find((p) => p.id === currentUser.id) || room.players[0];
   const isHost = room.hostId === currentUser.id;
   const isMyTurn = room.status === 'playing' && room.currentTurnPlayerId === currentUser.id;
   const opponents = room.players.filter((p) => p.id !== currentUser.id);
   const maxRounds = Math.max(0, ...room.players.map((p) => p.roundScores.length));
+
+  // Persist table UI state (Auto mode, card selection, draw choice, panels) across page refreshes
+  useEffect(() => {
+    try {
+      const payload: PersistedTableUiState = {
+        autoPlay,
+        showScoreboard,
+        showChat,
+        dismissedRoundModal,
+        dismissedRoundNumber: room.roundNumber,
+        selectedCardIds,
+        drawSource,
+        selectedVisibleIdx,
+        turnKey: `${room.roundNumber}:${room.turnsPlayedInRound}:${room.currentTurnPlayerId}`,
+      };
+      const serialized = JSON.stringify(payload);
+      sessionStorage.setItem(getTableUiStorageKey(room.code, currentUser.id), serialized);
+      localStorage.setItem(getTableUiStorageKey(room.code, currentUser.id), serialized);
+    } catch {
+      // ignore storage quota errors
+    }
+  }, [
+    room.code,
+    room.roundNumber,
+    room.turnsPlayedInRound,
+    room.currentTurnPlayerId,
+    currentUser.id,
+    autoPlay,
+    showScoreboard,
+    showChat,
+    dismissedRoundModal,
+    selectedCardIds,
+    drawSource,
+    selectedVisibleIdx,
+  ]);
 
   // Sound Effects when turn activates or when Declare happens
   useEffect(() => {
@@ -221,23 +315,33 @@ export function GameTable({
   }, [room.currentTurnPlayerId, room.status, currentUser.id]);
 
   const meHandIdsKey = me.hand.map((c) => c.id).join(',');
+  const turnChangeKey = `${room.currentTurnPlayerId}:${room.turnsPlayedInRound}:${room.roundNumber}`;
+  const prevTurnChangeKeyRef = useRef<string>(turnChangeKey);
+  const prevModalPhaseKeyRef = useRef<string>(`${room.status}:${room.roundNumber}`);
 
-  // Only clear drawSource when the turn or round actually changes!
-  // Do NOT include `me.hand` object reference in dependencies, or 1-second polling will reset drawSource!
+  // Only clear drawSource when the turn or round actually changes AFTER initial mount!
+  // Keeping this guarded preserves pre-selected drop cards & draw source across page refreshes.
   useEffect(() => {
-    setDrawSource(null);
-    setSelectedVisibleIdx(0);
-    setHintText(null);
-    setActionError(null);
-    setShowDeclareModal(false);
-    setSelectedCardIds((prev) =>
-      prev.filter((id) => meHandIdsKey.split(',').includes(id))
-    );
-  }, [room.currentTurnPlayerId, room.turnsPlayedInRound, room.roundNumber, meHandIdsKey]);
+    const validIds = meHandIdsKey.split(',');
+    setSelectedCardIds((prev) => prev.filter((id) => validIds.includes(id)));
+
+    if (prevTurnChangeKeyRef.current !== turnChangeKey) {
+      prevTurnChangeKeyRef.current = turnChangeKey;
+      setDrawSource(null);
+      setSelectedVisibleIdx(0);
+      setHintText(null);
+      setActionError(null);
+      setShowDeclareModal(false);
+    }
+  }, [turnChangeKey, meHandIdsKey]);
 
   useEffect(() => {
-    if (room.status === 'round_end' || room.status === 'game_over') {
-      setDismissedRoundModal(false);
+    const modalPhaseKey = `${room.status}:${room.roundNumber}`;
+    if (prevModalPhaseKeyRef.current !== modalPhaseKey) {
+      prevModalPhaseKeyRef.current = modalPhaseKey;
+      if (room.status === 'round_end' || room.status === 'game_over') {
+        setDismissedRoundModal(false);
+      }
     }
   }, [room.status, room.roundNumber]);
 
@@ -262,8 +366,19 @@ export function GameTable({
       return;
     }
 
-    // On a mid-round page reload/rejoin, keep existing hand immediately face-up
-    if (room.turnsPlayedInRound > 0 && !dealStartedAtRef.current[roundKey]) {
+    let alreadyDealtInSession = false;
+    try {
+      alreadyDealtInSession =
+        sessionStorage.getItem(getDealtRoundStorageKey(room.code, currentUser.id)) === roundKey;
+    } catch {
+      alreadyDealtInSession = false;
+    }
+
+    // On a page reload/rejoin (even at turn 0), keep already-dealt hand immediately face-up
+    if (
+      (room.turnsPlayedInRound > 0 || alreadyDealtInSession) &&
+      !dealStartedAtRef.current[roundKey]
+    ) {
       dealCompletedKeyRef.current = roundKey;
       setIsDealingRound(false);
       setRevealedCardCount(99);
@@ -291,6 +406,11 @@ export function GameTable({
 
       if (elapsed >= 240 + cardCount * 110 + 320) {
         dealCompletedKeyRef.current = roundKey;
+        try {
+          sessionStorage.setItem(getDealtRoundStorageKey(room.code, currentUser.id), roundKey);
+        } catch {
+          // ignore
+        }
         setIsDealingRound(false);
         setRevealedCardCount(99);
         clearInterval(interval);
@@ -307,6 +427,7 @@ export function GameTable({
     room.turnsPlayedInRound,
     room.settings.cardsPerPlayer,
     me.hand.length,
+    currentUser.id,
   ]);
 
   // Automatically disable Auto Mode if eliminated or match ends
