@@ -21,7 +21,7 @@
     "better-auth": "^1.7.25",
     "canvas-confetti": "^1.9.3",
     "lucide-react": "^0.475.0",
-    "next": "^15.5.29",
+    "next": "^16.4.6",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
