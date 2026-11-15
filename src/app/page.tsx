@@ -1,7 +1,12 @@
 'use client';
 
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { RoomState } from '@/lib/gameEngine';
+import {
+  DECK_DIFFICULTY_PROFILES,
+  DeckDifficulty,
+  RoomState,
+  normalizeDeckDifficulty,
+} from '@/lib/gameEngine';
 import { LobbyView } from '@/components/LobbyView';
 import { GameTable } from '@/components/GameTable';
 import { PlayingCard } from '@/components/PlayingCard';
@@ -18,10 +23,14 @@ import {
   Plus,
   Mail,
   Lock,
+  Eye,
+  EyeOff,
+  Settings,
+  Trash2,
+  ShieldAlert,
   User as UserIcon,
   CheckCircle2,
   AlertCircle,
-  Pencil,
   RotateCcw,
   Volume2,
   VolumeX,
@@ -38,6 +47,7 @@ interface UserSession {
 const STORAGE_USER_KEY = 'lowscore_user_session_v1';
 const STORAGE_ACTIVE_ROOM_KEY = 'lowscore_active_room_v1';
 const STORAGE_REJOIN_ROOM_KEY = 'lowscore_rejoin_room_v1';
+const STORAGE_DIFFICULTY_KEY = 'lowscore_deck_difficulty_v1';
 const LEGACY_USER_KEY = 'leastscore_user_session_v1';
 const LEGACY_ACTIVE_ROOM_KEY = 'leastscore_active_room_v1';
 const LEGACY_REJOIN_ROOM_KEY = 'leastscore_rejoin_room_v1';
@@ -99,6 +109,7 @@ export default function LeastScoreApp() {
   const [displayName, setDisplayName] = useState('');
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
 
   // Room & Navigation state
   const [room, setRoom] = useState<RoomState | null>(null);
@@ -110,10 +121,15 @@ export default function LeastScoreApp() {
   const [loadingAction, setLoadingAction] = useState(false);
   const [showRulesModal, setShowRulesModal] = useState(false);
 
-  // Edit Name Modal on Dashboard
-  const [editingName, setEditingName] = useState(false);
+  // User Profile & Account Management Modals on Dashboard
+  const [showProfileModal, setShowProfileModal] = useState(false);
   const [nameInput, setNameInput] = useState('');
+  const [profileSavedMessage, setProfileSavedMessage] = useState<string | null>(null);
+  const [confirmDeleteAccountModal, setConfirmDeleteAccountModal] = useState(false);
+  const [deletingAccount, setDeletingAccount] = useState(false);
+  const [deleteAccountError, setDeleteAccountError] = useState<string | null>(null);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+  const [aiDeckDifficulty, setAiDeckDifficulty] = useState<DeckDifficulty>('medium');
 
   const botTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const reconnectAttemptedRef = useRef<boolean>(false);
@@ -167,10 +183,15 @@ export default function LeastScoreApp() {
           const sessionUser = sessionRes?.data?.user as
             | { id: string; email: string; name: string; soundEnabled?: boolean }
             | undefined;
+          const sessionError = sessionRes?.error as
+            | { status?: number; message?: string }
+            | null
+            | undefined;
 
           if (sessionUser?.id && sessionUser?.email) {
             let remoteSound =
               typeof sessionUser.soundEnabled === 'boolean' ? sessionUser.soundEnabled : undefined;
+            let remoteDifficulty: DeckDifficulty | undefined;
             try {
               const prefRes = await fetch(
                 `/api/preferences?userId=${encodeURIComponent(sessionUser.id)}`,
@@ -178,10 +199,15 @@ export default function LeastScoreApp() {
               );
               if (prefRes.ok) {
                 const prefJson = (await prefRes.json()) as {
-                  preferences?: { soundEnabled?: boolean };
+                  preferences?: { soundEnabled?: boolean; defaultDeckDifficulty?: DeckDifficulty };
                 };
                 if (typeof prefJson?.preferences?.soundEnabled === 'boolean') {
                   remoteSound = prefJson.preferences.soundEnabled;
+                }
+                if (prefJson?.preferences?.defaultDeckDifficulty) {
+                  remoteDifficulty = normalizeDeckDifficulty(
+                    prefJson.preferences.defaultDeckDifficulty
+                  );
                 }
               }
             } catch {
@@ -194,6 +220,22 @@ export default function LeastScoreApp() {
               ? soundFX.loadPreference(sessionUser.id)
               : remoteSound ?? soundFX.loadPreference();
 
+            if (remoteDifficulty) {
+              setAiDeckDifficulty(remoteDifficulty);
+              try {
+                localStorage.setItem(STORAGE_DIFFICULTY_KEY, remoteDifficulty);
+              } catch {
+                // ignore
+              }
+            } else {
+              try {
+                const storedDiff = localStorage.getItem(STORAGE_DIFFICULTY_KEY);
+                if (storedDiff) setAiDeckDifficulty(normalizeDeckDifficulty(storedDiff));
+              } catch {
+                // ignore
+              }
+            }
+
             resolvedUser = {
               id: sessionUser.id,
               email: sessionUser.email,
@@ -203,8 +245,22 @@ export default function LeastScoreApp() {
             };
           } else if (parsedSaved?.isGuest) {
             resolvedUser = parsedSaved;
+            try {
+              const storedDiff = localStorage.getItem(STORAGE_DIFFICULTY_KEY);
+              if (storedDiff) setAiDeckDifficulty(normalizeDeckDifficulty(storedDiff));
+            } catch {
+              // ignore
+            }
+          } else if (
+            sessionError &&
+            sessionError.status !== 401 &&
+            sessionError.status !== 403 &&
+            parsedSaved
+          ) {
+            resolvedUser = parsedSaved;
           } else {
             localStorage.removeItem(STORAGE_USER_KEY);
+            localStorage.removeItem(LEGACY_USER_KEY);
           }
         } catch {
           if (parsedSaved) {
@@ -428,6 +484,7 @@ export default function LeastScoreApp() {
       if (signedUser?.id) {
         let remoteSound =
           typeof signedUser.soundEnabled === 'boolean' ? signedUser.soundEnabled : undefined;
+        let remoteDifficulty: DeckDifficulty | undefined;
         try {
           if (authMode === 'signup') {
             await fetch('/api/preferences', {
@@ -438,9 +495,11 @@ export default function LeastScoreApp() {
                 userId: signedUser.id,
                 name: signedUser.name || chosenName,
                 soundEnabled: localDefaultSound,
+                defaultDeckDifficulty: aiDeckDifficulty,
               }),
             });
             remoteSound = localDefaultSound;
+            remoteDifficulty = aiDeckDifficulty;
           } else {
             const prefRes = await fetch(
               `/api/preferences?userId=${encodeURIComponent(signedUser.id)}`,
@@ -448,15 +507,29 @@ export default function LeastScoreApp() {
             );
             if (prefRes.ok) {
               const prefJson = (await prefRes.json()) as {
-                preferences?: { soundEnabled?: boolean };
+                preferences?: { soundEnabled?: boolean; defaultDeckDifficulty?: DeckDifficulty };
               };
               if (typeof prefJson?.preferences?.soundEnabled === 'boolean') {
                 remoteSound = prefJson.preferences.soundEnabled;
+              }
+              if (prefJson?.preferences?.defaultDeckDifficulty) {
+                remoteDifficulty = normalizeDeckDifficulty(
+                  prefJson.preferences.defaultDeckDifficulty
+                );
               }
             }
           }
         } catch {
           // ignore transient D1 pref sync error
+        }
+
+        if (remoteDifficulty) {
+          setAiDeckDifficulty(remoteDifficulty);
+          try {
+            localStorage.setItem(STORAGE_DIFFICULTY_KEY, remoteDifficulty);
+          } catch {
+            // ignore
+          }
         }
 
         const hasLocalUserPref =
@@ -477,6 +550,8 @@ export default function LeastScoreApp() {
         setSoundEnabled(resolvedSound);
         localStorage.setItem(STORAGE_USER_KEY, JSON.stringify(sessionUser));
         reconnectAttemptedRef.current = false;
+        setShowPassword(false);
+        setPassword('');
         setUser(sessionUser);
       }
     } catch {
@@ -528,7 +603,12 @@ export default function LeastScoreApp() {
 
   const handleLogout = async () => {
     try {
-      await authClient.signOut();
+      await authClient.signOut({
+        fetchOptions: {
+          headers: { 'Content-Type': 'application/json' },
+          body: {},
+        },
+      });
     } catch {
       // ignore signOut network error
     }
@@ -538,6 +618,11 @@ export default function LeastScoreApp() {
     localStorage.removeItem(LEGACY_REJOIN_ROOM_KEY);
     writeActiveRoomCode(null);
     reconnectAttemptedRef.current = false;
+    setShowProfileModal(false);
+    setConfirmDeleteAccountModal(false);
+    setDeleteAccountError(null);
+    setProfileSavedMessage(null);
+    setShowPassword(false);
     setReconnectingCode(null);
     setRoom(null);
     setRejoinInfo(null);
@@ -564,6 +649,80 @@ export default function LeastScoreApp() {
     }
   };
 
+  const handleUpdateDefaultDifficulty = (difficulty: DeckDifficulty) => {
+    setAiDeckDifficulty(difficulty);
+    try {
+      localStorage.setItem(STORAGE_DIFFICULTY_KEY, difficulty);
+    } catch {
+      // ignore
+    }
+    if (user) {
+      fetch('/api/preferences', {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: user.id,
+          defaultDeckDifficulty: difficulty,
+        }),
+      }).catch(() => {});
+    }
+  };
+
+  const handleDeleteAccount = async () => {
+    if (!user || deletingAccount) return;
+    setDeletingAccount(true);
+    setDeleteAccountError(null);
+    try {
+      const res = await fetch('/api/account', {
+        method: 'DELETE',
+        cache: 'no-store',
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-cache',
+        },
+        body: JSON.stringify({
+          guestId: user.isGuest ? user.id : undefined,
+          activeRoomCode: room?.code || rejoinInfo?.code,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) {
+        setDeleteAccountError(data.error || 'Could not delete your account. Please try again.');
+        return;
+      }
+
+      try {
+        localStorage.removeItem(STORAGE_USER_KEY);
+        localStorage.removeItem(LEGACY_USER_KEY);
+        localStorage.removeItem(STORAGE_REJOIN_ROOM_KEY);
+        localStorage.removeItem(LEGACY_REJOIN_ROOM_KEY);
+        localStorage.removeItem(STORAGE_DIFFICULTY_KEY);
+        localStorage.removeItem(`lowscore_sound_pref_${user.id}`);
+        localStorage.removeItem(`leastscore_sound_pref_${user.id}`);
+      } catch {
+        // ignore storage cleanup errors
+      }
+      writeActiveRoomCode(null);
+      reconnectAttemptedRef.current = false;
+      setConfirmDeleteAccountModal(false);
+      setShowProfileModal(false);
+      setProfileSavedMessage(null);
+      setReconnectingCode(null);
+      setRoom(null);
+      setRejoinInfo(null);
+      setShowPassword(false);
+      setPassword('');
+      setAuthError(null);
+      setAuthMode('login');
+      setUser(null);
+    } catch {
+      setDeleteAccountError('Network error while deleting account. Please try again.');
+    } finally {
+      setDeletingAccount(false);
+    }
+  };
+
   // Room API Helpers
   const callRoomApi = async (
     action: string,
@@ -585,6 +744,19 @@ export default function LeastScoreApp() {
     });
     const data = (await res.json()) as { room?: RoomState | null; error?: string };
     if (!res.ok) {
+      if (res.status === 401 && !user.isGuest) {
+        try {
+          localStorage.removeItem(STORAGE_USER_KEY);
+          localStorage.removeItem(LEGACY_USER_KEY);
+        } catch {
+          // ignore
+        }
+        writeActiveRoomCode(null);
+        setRoom(null);
+        setRejoinInfo(null);
+        setAuthError(data.error || 'Your login session expired. Please log in again.');
+        setUser(null);
+      }
       throw new Error(data.error || 'Operation failed');
     }
 
@@ -618,6 +790,13 @@ export default function LeastScoreApp() {
     try {
       await callRoomApi('create', {
         botsConfig: { includeAI: false, easy: 0, hard: 0 },
+        settings: {
+          eliminationPoints: 100,
+          turnTimer: 45,
+          maxPlayers: 8,
+          cardsPerPlayer: 5,
+          deckDifficulty: aiDeckDifficulty,
+        },
       });
     } catch (e: unknown) {
       setDashboardError(e instanceof Error ? e.message : 'Could not create lobby');
@@ -633,6 +812,13 @@ export default function LeastScoreApp() {
     try {
       await callRoomApi('create', {
         botsConfig: { includeAI: true, easy: easyCount, hard: hardCount },
+        settings: {
+          eliminationPoints: 100,
+          turnTimer: 45,
+          maxPlayers: 8,
+          cardsPerPlayer: 5,
+          deckDifficulty: aiDeckDifficulty,
+        },
         autoStart: true,
       });
     } catch (e: unknown) {
@@ -798,14 +984,24 @@ export default function LeastScoreApp() {
               <div className="relative">
                 <Lock className="w-4 h-4 text-stone-400 absolute left-3 top-1/2 -translate-y-1/2" />
                 <input
-                  type="password"
+                  type={showPassword ? 'text' : 'password'}
                   required
                   minLength={4}
+                  autoComplete={authMode === 'login' ? 'current-password' : 'new-password'}
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="••••••••"
-                  className="w-full pl-9 pr-3 py-2.5 text-sm bg-white border border-stone-300 rounded-xl focus:outline-none focus:border-stone-900"
+                  className="w-full pl-9 pr-10 py-2.5 text-sm bg-white border border-stone-300 rounded-xl focus:outline-none focus:border-stone-900"
                 />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((prev) => !prev)}
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  title={showPassword ? 'Hide password' : 'Show password'}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 p-1 rounded-md text-stone-400 hover:text-stone-700 focus:outline-none touch-manipulation"
+                >
+                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
               </div>
             </div>
 
@@ -974,14 +1170,17 @@ export default function LeastScoreApp() {
             <span className="sm:hidden">Rules</span>
           </button>
 
-          {/* Profile Avatar (First 2 letters) + Edit Name */}
+          {/* User Profile & Settings Button */}
           <button
             onClick={() => {
               setNameInput(user.name);
-              setEditingName(true);
+              setProfileSavedMessage(null);
+              setDeleteAccountError(null);
+              setConfirmDeleteAccountModal(false);
+              setShowProfileModal(true);
             }}
-            title={`Change display name (${user.name})`}
-            aria-label="Edit display name"
+            title={`Profile & Settings (${user.name})`}
+            aria-label="Profile & Settings"
             className="flex items-center gap-1 sm:gap-2 bg-stone-100 hover:bg-stone-200/70 border border-stone-200 px-2 sm:px-3 py-1.5 rounded-lg text-xs transition-colors shrink-0"
           >
             <div className="w-5 h-5 sm:w-6 sm:h-6 rounded-full bg-stone-900 text-white flex items-center justify-center text-[10px] font-bold shrink-0">
@@ -990,7 +1189,7 @@ export default function LeastScoreApp() {
             <span className="hidden sm:inline font-semibold text-stone-900 max-w-[140px] truncate">
               {user.name}
             </span>
-            <Pencil className="w-3 h-3 text-stone-500 shrink-0" />
+            <Settings className="w-3.5 h-3.5 text-stone-500 shrink-0" />
           </button>
 
           <button
@@ -1108,6 +1307,34 @@ export default function LeastScoreApp() {
             <p className="text-xs text-stone-500">
               Jump straight into a 5-card match against computer opponents to practice combinations and declarations.
             </p>
+            <div className="flex flex-wrap items-center gap-2 pt-1">
+              <span className="text-[11px] font-semibold text-stone-700">Card Deal Level:</span>
+              <div className="inline-flex items-center rounded-lg bg-stone-100 border border-stone-200 p-0.5 gap-0.5">
+                {(['easy', 'medium', 'hard'] as const).map((level) => {
+                  const active = aiDeckDifficulty === level;
+                  return (
+                    <button
+                      key={level}
+                      type="button"
+                      onClick={() => handleUpdateDefaultDifficulty(level)}
+                      title={DECK_DIFFICULTY_PROFILES[level].description}
+                      className={`px-2.5 py-1 rounded-md text-[11px] font-semibold transition-colors ${
+                        active
+                          ? 'bg-stone-900 text-white shadow-2xs'
+                          : 'text-stone-600 hover:bg-white hover:text-stone-900'
+                      }`}
+                    >
+                      {DECK_DIFFICULTY_PROFILES[level].label}
+                    </button>
+                  );
+                })}
+              </div>
+              <span className="text-[11px] text-stone-500">
+                {aiDeckDifficulty === 'medium'
+                  ? 'Medium (Default)'
+                  : DECK_DIFFICULTY_PROFILES[aiDeckDifficulty].label}
+              </span>
+            </div>
           </div>
 
           <div className="w-full sm:w-auto grid grid-cols-2 sm:flex items-center gap-2 shrink-0">
@@ -1167,52 +1394,251 @@ export default function LeastScoreApp() {
             <div className="bg-[#FAF9F5] border border-stone-200 rounded-xl p-3.5 space-y-1">
               <div className="font-bold text-stone-900">3. Declare, Timer & Rejoin</div>
               <p>
-                Declare with the lowest sum for <strong>0 pts</strong> (undercut = <strong>20 + diff</strong>). Missing 3 turn timers auto-kicks; stepping away gives <strong>5 mins</strong> to rejoin while Bot plays.
+                Declare with the lowest or tied-lowest sum for <strong>0★ pts</strong> (same-sum players get <strong>+0</strong>; undercut only if strictly beaten = <strong>20 + diff</strong>). Deck defaults to <strong>Medium</strong> (Host can choose Easy / Medium / Hard). Missing 3 turn timers auto-kicks; stepping away gives <strong>5 mins</strong> to rejoin while Bot plays.
               </p>
             </div>
           </div>
         </div>
       </main>
 
-      {/* Edit Name Modal */}
-      {editingName && (
-        <div className="fixed inset-0 bg-stone-900/50 flex items-center justify-center p-4 z-50">
-          <form
-            onSubmit={async (e) => {
-              e.preventDefault();
-              await handleUpdateUserName(nameInput);
-              setEditingName(false);
-            }}
-            className="bg-white border border-stone-300 rounded-2xl max-w-sm w-full p-6 shadow-xl space-y-4"
-          >
-            <h3 className="text-base font-bold text-stone-900">Change Your Display Name</h3>
-            <p className="text-xs text-stone-500">
-              The first two letters of your name are used as your profile avatar.
-            </p>
-            <input
-              type="text"
-              required
-              maxLength={24}
-              value={nameInput}
-              onChange={(e) => setNameInput(e.target.value)}
-              className="w-full px-3 py-2 text-sm border border-stone-300 rounded-xl focus:outline-none focus:border-stone-900"
-            />
-            <div className="flex justify-end gap-2">
+      {/* User Profile & Settings Modal */}
+      {showProfileModal && (
+        <div className="fixed inset-0 bg-stone-900/50 flex items-center justify-center p-3 sm:p-4 z-50">
+          <div className="bg-white border border-stone-300 rounded-2xl max-w-md w-full max-h-[90vh] overflow-y-auto p-5 sm:p-6 shadow-xl space-y-5">
+            <div className="flex items-start justify-between gap-3 border-b border-stone-200 pb-4">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="w-11 h-11 rounded-full bg-stone-900 text-white flex items-center justify-center text-sm font-bold shrink-0">
+                  {user.name.slice(0, 2).toUpperCase()}
+                </div>
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <h3 className="text-base font-bold text-stone-900 truncate">{user.name}</h3>
+                    <span
+                      className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
+                        user.isGuest
+                          ? 'bg-amber-50 text-amber-700 border-amber-200'
+                          : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                      }`}
+                    >
+                      {user.isGuest ? 'Guest Mode' : 'Registered'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-stone-500 truncate mt-0.5">{user.email}</p>
+                </div>
+              </div>
               <button
                 type="button"
-                onClick={() => setEditingName(false)}
-                className="px-4 py-2 rounded-xl text-xs font-medium border border-stone-300 text-stone-700"
+                onClick={() => setShowProfileModal(false)}
+                className="text-xs text-stone-500 hover:text-stone-900 font-semibold shrink-0"
+              >
+                Close
+              </button>
+            </div>
+
+            {/* Display Name Form */}
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                await handleUpdateUserName(nameInput);
+                setProfileSavedMessage('Display name updated');
+              }}
+              className="space-y-2"
+            >
+              <label className="block text-xs font-semibold text-stone-800">
+                Display Name
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  required
+                  maxLength={24}
+                  value={nameInput}
+                  onChange={(e) => {
+                    setNameInput(e.target.value);
+                    setProfileSavedMessage(null);
+                  }}
+                  placeholder="Your table display name"
+                  className="flex-1 min-w-0 px-3 py-2 text-sm border border-stone-300 rounded-xl focus:outline-none focus:border-stone-900"
+                />
+                <button
+                  type="submit"
+                  className="px-3.5 py-2 rounded-xl text-xs font-semibold bg-stone-900 hover:bg-stone-800 text-white shrink-0"
+                >
+                  Save
+                </button>
+              </div>
+              {profileSavedMessage ? (
+                <p className="text-[11px] text-emerald-600 font-medium flex items-center gap-1">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  {profileSavedMessage}
+                </p>
+              ) : (
+                <p className="text-[11px] text-stone-500">
+                  First two letters appear as your table avatar badge.
+                </p>
+              )}
+            </form>
+
+            {/* User Preferences & Settings */}
+            <div className="space-y-3 bg-[#FAF9F5] border border-stone-200 rounded-xl p-3.5">
+              <div className="text-xs font-bold text-stone-900">Preferences &amp; Game Defaults</div>
+
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-xs font-semibold text-stone-800">Sound Effects</div>
+                  <div className="text-[11px] text-stone-500">
+                    Card deals, turns &amp; declare alerts
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleToggleSound}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors flex items-center gap-1.5 shrink-0 ${
+                    soundEnabled
+                      ? 'bg-stone-900 text-white border-stone-900'
+                      : 'bg-white text-stone-600 border-stone-300 hover:bg-stone-100'
+                  }`}
+                >
+                  {soundEnabled ? (
+                    <>
+                      <Volume2 className="w-3.5 h-3.5" />
+                      On
+                    </>
+                  ) : (
+                    <>
+                      <VolumeX className="w-3.5 h-3.5" />
+                      Off
+                    </>
+                  )}
+                </button>
+              </div>
+
+              <div className="pt-2 border-t border-stone-200/80 space-y-1.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="text-xs font-semibold text-stone-800">
+                      Default Card Deal Level
+                    </div>
+                    <div className="text-[11px] text-stone-500">
+                      Used for new lobbies &amp; AI practice
+                    </div>
+                  </div>
+                  <div className="inline-flex items-center rounded-lg bg-white border border-stone-200 p-0.5 gap-0.5">
+                    {(['easy', 'medium', 'hard'] as const).map((level) => {
+                      const active = aiDeckDifficulty === level;
+                      return (
+                        <button
+                          key={level}
+                          type="button"
+                          onClick={() => handleUpdateDefaultDifficulty(level)}
+                          className={`px-2 py-1 rounded-md text-[11px] font-semibold transition-colors ${
+                            active
+                              ? 'bg-stone-900 text-white'
+                              : 'text-stone-600 hover:bg-stone-100 hover:text-stone-900'
+                          }`}
+                        >
+                          {DECK_DIFFICULTY_PROFILES[level].label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              <p className="text-[11px] text-stone-500 pt-1 border-t border-stone-200/80">
+                Your account and settings are kept permanently, while temporary game rooms and expired tokens auto-clean after 24 hours.
+              </p>
+            </div>
+
+            {/* Danger Zone: Account Deletion */}
+            <div className="bg-red-50/70 border border-red-200 rounded-xl p-3.5 space-y-2.5">
+              <div className="flex items-center gap-1.5 text-xs font-bold text-red-700">
+                <ShieldAlert className="w-4 h-4 shrink-0" />
+                <span>Danger Zone</span>
+              </div>
+              <p className="text-[11px] text-red-700/90 leading-relaxed">
+                {user.isGuest
+                  ? 'Clear your guest session, local profile, and temporary guest preferences from this browser and server.'
+                  : 'Permanently delete your account, login credentials, sessions, and saved preferences from the Cloudflare D1 database. This cannot be undone.'}
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setDeleteAccountError(null);
+                  setConfirmDeleteAccountModal(true);
+                }}
+                className="w-full sm:w-auto px-3.5 py-2 rounded-xl text-xs font-semibold bg-white border border-red-300 text-red-700 hover:bg-red-600 hover:text-white hover:border-red-600 transition-colors flex items-center justify-center gap-1.5"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                {user.isGuest ? 'Delete Guest Profile' : 'Delete Account'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Account Confirmation Modal */}
+      {confirmDeleteAccountModal && (
+        <div className="fixed inset-0 bg-stone-900/60 flex items-center justify-center p-4 z-[60]">
+          <div className="bg-white border border-red-200 rounded-2xl max-w-sm w-full p-5 sm:p-6 shadow-2xl space-y-4">
+            <div className="flex items-center gap-2.5 text-red-600">
+              <div className="w-9 h-9 rounded-xl bg-red-100 flex items-center justify-center shrink-0">
+                <Trash2 className="w-4 h-4" />
+              </div>
+              <h3 className="text-base font-bold text-stone-900">
+                {user.isGuest ? 'Delete Guest Profile?' : 'Permanently Delete Account?'}
+              </h3>
+            </div>
+
+            <p className="text-xs text-stone-600 leading-relaxed">
+              {user.isGuest ? (
+                <>
+                  This will remove your guest profile (<strong>{user.name}</strong>) and return you to the sign-in screen.
+                </>
+              ) : (
+                <>
+                  Are you sure you want to permanently delete <strong>{user.name}</strong> (
+                  <span className="font-mono">{user.email}</span>)? This immediately removes your
+                  records from the <strong>users</strong>, <strong>accounts</strong>,{' '}
+                  <strong>sessions</strong>, and <strong>preferences</strong> tables in the database and cannot be reversed.
+                </>
+              )}
+            </p>
+
+            {deleteAccountError && (
+              <div className="bg-red-50 border border-red-200 text-red-700 text-xs px-3 py-2 rounded-xl flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{deleteAccountError}</span>
+              </div>
+            )}
+
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                type="button"
+                disabled={deletingAccount}
+                onClick={() => {
+                  setConfirmDeleteAccountModal(false);
+                  setDeleteAccountError(null);
+                }}
+                className="px-4 py-2 rounded-xl text-xs font-medium border border-stone-300 text-stone-700 hover:bg-stone-50 disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
-                type="submit"
-                className="px-4 py-2 rounded-xl text-xs font-semibold bg-stone-900 text-white"
+                type="button"
+                disabled={deletingAccount}
+                onClick={handleDeleteAccount}
+                className="px-4 py-2 rounded-xl text-xs font-semibold bg-red-600 hover:bg-red-700 text-white flex items-center gap-1.5 disabled:opacity-60"
               >
-                Save Name
+                <Trash2 className="w-3.5 h-3.5" />
+                {deletingAccount
+                  ? 'Deleting...'
+                  : user.isGuest
+                  ? 'Yes, Delete Guest'
+                  : 'Yes, Delete Account'}
               </button>
             </div>
-          </form>
+          </div>
         </div>
       )}
 
@@ -1249,7 +1675,13 @@ export default function LeastScoreApp() {
                 <br />• <strong>5 Cards:</strong> A 5-card sequence OR a 5-card Flush (all 5 same suit).
               </p>
               <p>
-                <strong>Turn Timer & Rejoin:</strong> If your turn timer runs out, the bot logic auto-drops for you. After 3 consecutive auto-drops, you are auto-kicked. If you click <strong>Back</strong> to step away, you have <strong>5 minutes</strong> to rejoin while the bot plays your turns.
+                <strong>Declare &amp; Ties:</strong> Declaring with the lowest or tied-lowest sum scores <strong>0★ pts</strong> for the declarer, while any tying opponent receives <strong>+0 pts</strong>. You suffer an undercut (<strong>20 + diff</strong>) only if an opponent holds a strictly lower sum.
+              </p>
+              <p>
+                <strong>Card Deal Levels (Host):</strong> Matches default to <strong>Medium</strong> so deck draws aren&apos;t overly favorable. Hosts can switch between <strong>Easy</strong>, <strong>Medium</strong>, and <strong>Hard</strong> in the Lobby.
+              </p>
+              <p>
+                <strong>Turn Timer &amp; Rejoin:</strong> If your turn timer runs out, the bot logic auto-drops for you. After 3 consecutive auto-drops, you are auto-kicked. If you click <strong>Back</strong> to step away, you have <strong>5 minutes</strong> to rejoin while the bot plays your turns.
               </p>
             </div>
             <div className="pt-2 text-right">

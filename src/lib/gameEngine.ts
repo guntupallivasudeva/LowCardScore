@@ -32,11 +32,14 @@ export interface Player {
   disconnectedAt?: number;
 }
 
+export type DeckDifficulty = 'easy' | 'medium' | 'hard';
+
 export interface GameSettings {
   eliminationPoints: number;
   turnTimer: number;
   maxPlayers: number;
   cardsPerPlayer: number;
+  deckDifficulty?: DeckDifficulty;
 }
 
 export interface RoundSummary {
@@ -83,12 +86,14 @@ export interface RoomState {
   exposedPile: Card[];
   currentTurnPlayerId: string;
   roundStarterPlayerId?: string;
+  roundStarterNextId?: string;
   turnsPlayedInRound: number;
   roundNumber: number;
   turnStartTime: number;
   lastRoundSummary?: RoundSummary;
   winnerId?: string;
   chat: ChatMessage[];
+  createdAt?: number;
   updatedAt: number;
 }
 
@@ -175,6 +180,49 @@ export function shuffle<T>(array: T[]): T[] {
     [arr[i], arr[j]] = [arr[j], arr[i]];
   }
   return arr;
+}
+
+export interface DeckDifficultyProfile {
+  label: string;
+  description: string;
+  dealCandidates: number;
+  suppressFavoredPct: number;
+  boostFavoredPct: number;
+  preferHeavyPct: number;
+}
+
+export const DECK_DIFFICULTY_PROFILES: Record<DeckDifficulty, DeckDifficultyProfile> = {
+  easy: {
+    label: 'Easy',
+    description: 'More favorable draws & starting combinations',
+    dealCandidates: 4,
+    suppressFavoredPct: 0,
+    boostFavoredPct: 35,
+    preferHeavyPct: 20,
+  },
+  medium: {
+    label: 'Medium',
+    description: 'Balanced challenge — prevents easy deck streaks',
+    dealCandidates: 8,
+    suppressFavoredPct: 72,
+    boostFavoredPct: 0,
+    preferHeavyPct: 30,
+  },
+  hard: {
+    label: 'Hard',
+    description: 'Minimal lucky deck draws — open-pile strategy focused',
+    dealCandidates: 12,
+    suppressFavoredPct: 92,
+    boostFavoredPct: 0,
+    preferHeavyPct: 60,
+  },
+};
+
+export function normalizeDeckDifficulty(value?: unknown): DeckDifficulty {
+  if (value === 'easy' || value === 'hard' || value === 'medium') {
+    return value;
+  }
+  return 'medium';
 }
 
 export function getCardValue(card: Card): number {
@@ -273,6 +321,210 @@ export function getAllValidDiscards(hand: Card[]): { cards: Card[]; pointsRemove
   });
 
   return results;
+}
+
+/**
+ * Checks if adding `candidate` to `hand` forms a pair, 4-of-a-kind, 3/5-card sequence, or 5-card flush.
+ */
+function createsComboWithHand(hand: Card[], candidate: Card): boolean {
+  if (hand.some((c) => c.rank === candidate.rank)) return true;
+
+  const n = hand.length;
+  // 3-card sequence with any 2 cards already in hand
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      if (isValidDiscard([hand[i], hand[j], candidate]).valid) {
+        return true;
+      }
+    }
+  }
+
+  // 5-card sequence or flush when 4+ cards remain
+  if (n >= 4) {
+    const sameSuitCount = hand.filter((c) => c.suit === candidate.suit).length;
+    if (sameSuitCount >= 4) return true;
+    for (let skip = n === 4 ? -1 : 0; skip < n; skip++) {
+      const four = skip === -1 ? hand : hand.filter((_, idx) => idx !== skip);
+      if (four.length === 4 && isValidDiscard([...four, candidate]).valid) {
+        return true;
+      }
+      if (skip === -1) break;
+    }
+  }
+
+  return false;
+}
+
+function isFavoredDeckCard(
+  candidate: Card,
+  remainingHand: Card[],
+  difficulty: DeckDifficulty
+): boolean {
+  if (createsComboWithHand(remainingHand, candidate)) return true;
+  const val = getCardValue(candidate);
+  const handSum = getHandSum(remainingHand);
+  if (val <= 2 && handSum <= 18) return true;
+  if (difficulty === 'hard' && val <= 3 && handSum <= 26) return true;
+  return false;
+}
+
+function scoreStartingDealEase(hands: Card[][], cardsPerHand: number): number {
+  let ease = 0;
+  for (const hand of hands) {
+    const sum = getHandSum(hand);
+    const combos = getAllValidDiscards(hand).filter((m) => m.cards.length >= 2);
+    const multiCount = combos.length;
+    const bigCombo = combos.some((m) => m.cards.length >= 3);
+    if (multiCount > 0) ease += 2 + Math.min(3, multiCount);
+    if (bigCombo) ease += 3;
+    if (sum <= cardsPerHand * 3.4) ease += 8;
+    else if (sum <= cardsPerHand * 4.4) ease += 3;
+    const veryLowCards = hand.filter((c) => getCardValue(c) <= 2).length;
+    if (veryLowCards >= 2) ease += 2;
+  }
+  return ease;
+}
+
+/**
+ * Deals starting hands using genuine full shuffled decks calibrated to the room's deck difficulty.
+ */
+export function dealBalancedDeck(
+  playerIds: string[],
+  cardsPerHand: number,
+  numDecks: number,
+  difficulty: DeckDifficulty
+): {
+  dealtHands: Map<string, Card[]>;
+  firstVisible: Card;
+  remainingDeck: Card[];
+} {
+  const profile = DECK_DIFFICULTY_PROFILES[difficulty];
+  const samples: {
+    ease: number;
+    dealtHands: Map<string, Card[]>;
+    firstVisible: Card;
+    remainingDeck: Card[];
+  }[] = [];
+
+  for (let s = 0; s < profile.dealCandidates; s++) {
+    const fullDeck = createDeck(numDecks);
+    const dealtHands = new Map<string, Card[]>(playerIds.map((id) => [id, []]));
+    let cursor = 0;
+    for (let r = 0; r < cardsPerHand; r++) {
+      for (const pid of playerIds) {
+        dealtHands.get(pid)!.push({ ...fullDeck[cursor], isNew: false });
+        cursor += 1;
+      }
+    }
+    const firstVisible = fullDeck[cursor];
+    const remainingDeck = fullDeck.slice(cursor + 1);
+    const handsArr = playerIds.map((id) => dealtHands.get(id)!);
+    samples.push({
+      ease: scoreStartingDealEase(handsArr, cardsPerHand),
+      dealtHands,
+      firstVisible,
+      remainingDeck,
+    });
+  }
+
+  if (difficulty === 'easy') {
+    samples.sort((a, b) => b.ease - a.ease);
+  } else if (difficulty === 'hard') {
+    samples.sort((a, b) => a.ease - b.ease);
+  } else {
+    // Medium: target realistic balanced hands near moderate ease (avoid turn-1 low hands)
+    const targetEase = Math.max(2, Math.round(playerIds.length * 1.25));
+    samples.sort((a, b) => Math.abs(a.ease - targetEase) - Math.abs(b.ease - targetEase));
+  }
+
+  const pickWindow = Math.min(2, samples.length);
+  const chosen = samples[secureRandomInt(pickWindow)];
+  return {
+    dealtHands: chosen.dealtHands,
+    firstVisible: chosen.firstVisible,
+    remainingDeck: chosen.remainingDeck,
+  };
+}
+
+/**
+ * Draws a real card from the finite remaining deck, applying Easy / Medium / Hard
+ * randomization control so blind deck draws are balanced without inventing cards.
+ */
+export function drawFromShuffledDeck(
+  deck: Card[],
+  remainingHand: Card[],
+  difficulty: DeckDifficulty
+): { card: Card | undefined; remainingDeck: Card[] } {
+  if (deck.length === 0) return { card: undefined, remainingDeck: [] };
+  if (deck.length === 1) return { card: deck[0], remainingDeck: [] };
+
+  const profile = DECK_DIFFICULTY_PROFILES[difficulty];
+  const topCard = deck[0];
+
+  if (difficulty === 'easy') {
+    if (!isFavoredDeckCard(topCard, remainingHand, difficulty) && secureRandomInt(100) < profile.boostFavoredPct) {
+      const lookahead = Math.min(8, deck.length);
+      const favoredIndices: number[] = [];
+      for (let i = 1; i < lookahead; i++) {
+        if (isFavoredDeckCard(deck[i], remainingHand, difficulty) || getCardValue(deck[i]) <= 3) {
+          favoredIndices.push(i);
+        }
+      }
+      if (favoredIndices.length > 0) {
+        const chosenIdx = favoredIndices[secureRandomInt(favoredIndices.length)];
+        return {
+          card: deck[chosenIdx],
+          remainingDeck: deck.filter((_, idx) => idx !== chosenIdx),
+        };
+      }
+    }
+    return { card: topCard, remainingDeck: deck.slice(1) };
+  }
+
+  // Medium / Hard: prevent too-frequent lucky pairs, sequences, or repeated ultra-low deck hits
+  if (
+    isFavoredDeckCard(topCard, remainingHand, difficulty) &&
+    secureRandomInt(100) < profile.suppressFavoredPct
+  ) {
+    const midNonFavored: number[] = [];
+    const heavyNonFavored: number[] = [];
+    const otherNonFavored: number[] = [];
+
+    for (let i = 1; i < deck.length; i++) {
+      const cand = deck[i];
+      if (!isFavoredDeckCard(cand, remainingHand, difficulty)) {
+        const v = getCardValue(cand);
+        if (v >= 4 && v <= 8) midNonFavored.push(i);
+        else if (v >= 9) heavyNonFavored.push(i);
+        else otherNonFavored.push(i);
+      }
+    }
+
+    const wantHeavy = secureRandomInt(100) < profile.preferHeavyPct;
+    const primaryPool = wantHeavy ? heavyNonFavored : midNonFavored;
+    const secondaryPool = wantHeavy ? midNonFavored : heavyNonFavored;
+    const chosenPool =
+      primaryPool.length > 0
+        ? primaryPool
+        : secondaryPool.length > 0
+        ? secondaryPool
+        : otherNonFavored;
+
+    if (chosenPool.length > 0) {
+      const chosenIdx = chosenPool[secureRandomInt(chosenPool.length)];
+      const nextDeck = deck.filter((_, idx) => idx !== chosenIdx);
+      // Tuck the skipped favored top card slightly deeper into the deck so the very next player
+      // doesn't always inherit an unnaturally curated top card either.
+      if (nextDeck.length > 3) {
+        const skipped = nextDeck.shift()!;
+        const insertAt = 1 + secureRandomInt(Math.min(6, nextDeck.length));
+        nextDeck.splice(insertAt, 0, skipped);
+      }
+      return { card: deck[chosenIdx], remainingDeck: nextDeck };
+    }
+  }
+
+  return { card: topCard, remainingDeck: deck.slice(1) };
 }
 
 export function canPlayerDeclare(room: RoomState, playerId: string): boolean {

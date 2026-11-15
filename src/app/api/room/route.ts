@@ -1,19 +1,52 @@
 import { NextRequest } from 'next/server';
+import { getAuth } from '@/lib/auth';
 import { noStoreJson } from '@/lib/cloudflareDb';
-import { deleteRoom, getRoom, roomExists, saveRoom } from '@/lib/serverStore';
+import {
+  deleteRoom,
+  getRoom,
+  isRegisteredUserInStore,
+  roomExists,
+  saveRoom,
+} from '@/lib/serverStore';
 import {
   createInitialRoom,
   executeDeclare,
   executeMakeMove,
   generateLobbyCode,
   kickOrRemovePlayer,
+  sortPlayersByJoinOrder,
   startRound,
   syncBotsInLobby,
   checkRoomTimersAndAutoPlay,
 } from '@/lib/roomController';
-import { computeBotAction, shuffle } from '@/lib/gameEngine';
+import {
+  DeckDifficulty,
+  GameSettings,
+  computeBotAction,
+  normalizeDeckDifficulty,
+  shuffle,
+} from '@/lib/gameEngine';
 
 export const dynamic = 'force-dynamic';
+
+function sanitizeSettings(
+  incoming: Partial<GameSettings> | undefined,
+  base: GameSettings
+): GameSettings {
+  return {
+    eliminationPoints: Math.max(
+      50,
+      Math.min(300, Number(incoming?.eliminationPoints ?? base.eliminationPoints) || 100)
+    ),
+    turnTimer: Math.max(15, Math.min(120, Number(incoming?.turnTimer ?? base.turnTimer) || 45)),
+    maxPlayers: Math.max(2, Math.min(8, Number(incoming?.maxPlayers ?? base.maxPlayers) || 8)),
+    cardsPerPlayer: Math.max(
+      3,
+      Math.min(7, Number(incoming?.cardsPerPlayer ?? base.cardsPerPlayer) || 5)
+    ),
+    deckDifficulty: normalizeDeckDifficulty(incoming?.deckDifficulty ?? base.deckDifficulty),
+  };
+}
 
 interface RoomRequestBody {
   action?: string;
@@ -21,12 +54,7 @@ interface RoomRequestBody {
   player?: { id: string; name: string; email?: string };
   payload?: {
     botsConfig?: { includeAI: boolean; easy: number; hard: number };
-    settings?: {
-      eliminationPoints: number;
-      turnTimer: number;
-      maxPlayers: number;
-      cardsPerPlayer: number;
-    };
+    settings?: Partial<GameSettings> & { deckDifficulty?: DeckDifficulty };
     autoStart?: boolean;
     name?: string;
     targetPlayerId?: string;
@@ -55,8 +83,16 @@ export async function GET(req: NextRequest) {
     if (playerId) {
       const p = rawRoom.players.find((pl) => pl.id === playerId);
       if (p && p.disconnectedAt) {
-        p.disconnectedAt = undefined;
-        modified = true;
+        let canClearDisconnect = true;
+        if (!playerId.startsWith('guest_') && (await isRegisteredUserInStore(playerId))) {
+          const auth = await getAuth(req);
+          const session = await auth.api.getSession({ headers: req.headers }).catch(() => null);
+          canClearDisconnect = session?.user?.id === playerId;
+        }
+        if (canClearDisconnect) {
+          p.disconnectedAt = undefined;
+          modified = true;
+        }
       }
     }
 
@@ -87,6 +123,29 @@ export async function POST(req: NextRequest) {
     const body = (await req.json()) as RoomRequestBody;
     const { action, code: rawCode, player, payload } = body;
 
+    if (
+      action !== 'bot_turn' &&
+      action !== 'timeout_turn' &&
+      player?.id &&
+      !player.id.startsWith('guest_')
+    ) {
+      const auth = await getAuth(req);
+      const session = await auth.api.getSession({ headers: req.headers }).catch(() => null);
+      if (session?.user) {
+        if (session.user.id !== player.id) {
+          return noStoreJson(
+            { error: 'Session mismatch. Please log in again.' },
+            { status: 401 }
+          );
+        }
+      } else if (await isRegisteredUserInStore(player.id)) {
+        return noStoreJson(
+          { error: 'Your login session has expired. Please log in again.' },
+          { status: 401 }
+        );
+      }
+    }
+
     if (action === 'create') {
       if (!player?.id || !player?.name) {
         return noStoreJson({ error: 'Player info required' }, { status: 400 });
@@ -108,7 +167,7 @@ export async function POST(req: NextRequest) {
         newRoom = syncBotsInLobby(newRoom);
       }
       if (payload?.settings) {
-        newRoom.settings = payload.settings;
+        newRoom.settings = sanitizeSettings(payload.settings, newRoom.settings);
       }
       if (payload?.autoStart) {
         newRoom = startRound(newRoom, true);
@@ -135,6 +194,7 @@ export async function POST(req: NextRequest) {
         }
         alreadyIn.name = player.name;
         alreadyIn.disconnectedAt = undefined;
+        room.players = sortPlayersByJoinOrder(room.players, room.hostId);
         room.updatedAt = Date.now();
         await saveRoom(room);
         return noStoreJson({ room });
@@ -150,6 +210,10 @@ export async function POST(req: NextRequest) {
         );
       }
 
+      const maxHumanJoinedAt = room.players
+        .filter((p) => !p.isBot)
+        .reduce((max, p) => Math.max(max, p.joinedAt || 0), 0);
+
       room.players.push({
         id: player.id,
         name: player.name,
@@ -160,7 +224,7 @@ export async function POST(req: NextRequest) {
         score: 0,
         roundScores: [],
         isEliminated: false,
-        joinedAt: Date.now(),
+        joinedAt: Math.max(Date.now(), maxHumanJoinedAt + 1),
         missedTurns: 0,
       });
       const synced = syncBotsInLobby(room);
@@ -199,23 +263,25 @@ export async function POST(req: NextRequest) {
         return noStoreJson({ error: 'Only the host can change lobby settings.' }, { status: 403 });
       }
       if (payload?.settings) {
-        room.settings = {
-          eliminationPoints: Math.max(50, Math.min(300, Number(payload.settings.eliminationPoints) || 100)),
-          turnTimer: Math.max(15, Math.min(120, Number(payload.settings.turnTimer) || 45)),
-          maxPlayers: Math.max(2, Math.min(8, Number(payload.settings.maxPlayers) || 8)),
-          cardsPerPlayer: Math.max(3, Math.min(7, Number(payload.settings.cardsPerPlayer) || 5)),
-        };
+        if (room.status === 'lobby') {
+          room.settings = sanitizeSettings(payload.settings, room.settings);
+        } else if (payload.settings.deckDifficulty) {
+          room.settings = {
+            ...room.settings,
+            deckDifficulty: normalizeDeckDifficulty(payload.settings.deckDifficulty),
+          };
+        }
       }
-      if (payload?.botsConfig) {
+      if (room.status === 'lobby' && payload?.botsConfig) {
         room.botsConfig = {
           includeAI: Boolean(payload.botsConfig.includeAI),
           easy: Math.max(0, Math.min(7, Number(payload.botsConfig.easy) || 0)),
           hard: Math.max(0, Math.min(7, Number(payload.botsConfig.hard) || 0)),
         };
       }
-      const synced = syncBotsInLobby(room);
-      await saveRoom(synced);
-      return noStoreJson({ room: synced });
+      const nextRoom = room.status === 'lobby' ? syncBotsInLobby(room) : { ...room, updatedAt: Date.now() };
+      await saveRoom(nextRoom);
+      return noStoreJson({ room: nextRoom });
     }
 
     if (action === 'kick') {
@@ -374,19 +440,22 @@ export async function POST(req: NextRequest) {
     }
 
     if (action === 'return_to_lobby') {
-      const resetPlayers = room.players
-        .filter((p) => !p.isKicked)
-        .map((p) => ({
-          ...p,
-          hand: [],
-          score: 0,
-          roundScores: [],
-          isEliminated: false,
-          isKicked: false,
-          lastDraw: undefined,
-          lastDiscard: undefined,
-          missedTurns: 0,
-        }));
+      const resetPlayers = sortPlayersByJoinOrder(
+        room.players
+          .filter((p) => !p.isKicked)
+          .map((p) => ({
+            ...p,
+            hand: [],
+            score: 0,
+            roundScores: [],
+            isEliminated: false,
+            isKicked: false,
+            lastDraw: undefined,
+            lastDiscard: undefined,
+            missedTurns: 0,
+          })),
+        room.hostId
+      );
       const lobbyRoom = {
         ...room,
         status: 'lobby' as const,
@@ -396,6 +465,9 @@ export async function POST(req: NextRequest) {
         exposedPile: [],
         lastRoundSummary: undefined,
         winnerId: undefined,
+        roundStarterPlayerId: room.hostId,
+        roundStarterNextId: undefined,
+        turnsPlayedInRound: 0,
         updatedAt: Date.now(),
       };
       await saveRoom(lobbyRoom);

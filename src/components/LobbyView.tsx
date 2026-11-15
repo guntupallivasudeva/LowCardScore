@@ -1,7 +1,13 @@
 'use client';
 
 import React, { useState } from 'react';
-import { GameSettings, RoomState } from '@/lib/gameEngine';
+import {
+  DECK_DIFFICULTY_PROFILES,
+  DeckDifficulty,
+  GameSettings,
+  RoomState,
+  normalizeDeckDifficulty,
+} from '@/lib/gameEngine';
 import {
   Copy,
   Check,
@@ -75,7 +81,10 @@ export function LobbyView({
     turnTimer: room.settings.turnTimer ?? 45,
     maxPlayers: room.settings.maxPlayers ?? 8,
     cardsPerPlayer: room.settings.cardsPerPlayer ?? 5,
+    deckDifficulty: normalizeDeckDifficulty(room.settings.deckDifficulty),
   };
+
+  const activeDifficulty = normalizeDeckDifficulty(currentSettings.deckDifficulty);
 
   const handleCopyCode = () => {
     navigator.clipboard.writeText(room.code);
@@ -97,7 +106,7 @@ export function LobbyView({
   };
 
   const adjustSetting = async (
-    key: keyof GameSettings,
+    key: 'eliminationPoints' | 'turnTimer' | 'maxPlayers' | 'cardsPerPlayer',
     delta: number,
     min: number,
     max: number
@@ -105,6 +114,11 @@ export function LobbyView({
     if (!isHost) return;
     const nextVal = Math.max(min, Math.min(max, currentSettings[key] + delta));
     await onUpdateSettings({ ...currentSettings, [key]: nextVal }, room.botsConfig);
+  };
+
+  const changeDeckDifficulty = async (level: DeckDifficulty) => {
+    if (!isHost || activeDifficulty === level) return;
+    await onUpdateSettings({ ...currentSettings, deckDifficulty: level }, room.botsConfig);
   };
 
   const toggleIncludeAI = async () => {
@@ -543,6 +557,38 @@ export function LobbyView({
                 >
                   <Plus className="w-3.5 h-3.5" />
                 </button>
+              </div>
+            </div>
+
+            {/* Card Deck Difficulty (Default: Medium) */}
+            <div className="pt-3 border-t border-stone-100 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <div className="text-xs font-semibold text-stone-800">Card Deal &amp; Deck Level</div>
+                  <div className="text-[11px] text-stone-500">
+                    {DECK_DIFFICULTY_PROFILES[activeDifficulty].description}
+                  </div>
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-1.5 bg-stone-100 p-1 rounded-xl border border-stone-200">
+                {(['easy', 'medium', 'hard'] as DeckDifficulty[]).map((lvl) => {
+                  const selected = activeDifficulty === lvl;
+                  return (
+                    <button
+                      key={lvl}
+                      type="button"
+                      disabled={!isHost}
+                      onClick={() => changeDeckDifficulty(lvl)}
+                      className={`py-1.5 px-2 rounded-lg text-xs font-semibold transition-all disabled:opacity-60 ${
+                        selected
+                          ? 'bg-stone-900 text-white shadow-2xs'
+                          : 'text-stone-700 hover:bg-white/70'
+                      }`}
+                    >
+                      {DECK_DIFFICULTY_PROFILES[lvl].label}
+                    </button>
+                  );
+                })}
               </div>
             </div>
 

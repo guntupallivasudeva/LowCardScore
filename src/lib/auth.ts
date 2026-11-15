@@ -1,6 +1,6 @@
 import { betterAuth } from 'better-auth';
 import { memoryAdapter } from 'better-auth/adapters/memory';
-import { ensureD1Schema, getCloudflareRuntime } from './cloudflareDb';
+import { ensureD1Schema, getCloudflareRuntime, maybeAutoCleanupDatabase } from './cloudflareDb';
 
 const globalAuthFallback = globalThis as unknown as {
   __lowscore_memory_db?: Record<string, Record<string, unknown>[]>;
@@ -115,6 +115,19 @@ function isLocalHostname(hostname: string): boolean {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
 }
 
+function isTrustedProxyOrigin(originUrl: URL): boolean {
+  const host = originUrl.hostname.toLowerCase();
+  if (originUrl.protocol !== 'https:') return false;
+  return (
+    host.endsWith('.workers.dev') ||
+    host.endsWith('.trycloudflare.com') ||
+    host.endsWith('.loca.lt') ||
+    host.endsWith('.ngrok-free.app') ||
+    host.endsWith('.ngrok-free.dev') ||
+    host.endsWith('.ngrok.io')
+  );
+}
+
 function resolveRequestOrigin(
   req: Request
 ): { origin: string; hostname: string; host: string; protocol: string } | null {
@@ -124,10 +137,40 @@ function resolveRequestOrigin(
     const headerHost = forwardedHost || req.headers.get('host')?.trim() || '';
     const rawHost = headerHost || url.host;
     const forwardedProto = req.headers.get('x-forwarded-proto')?.split(',')[0]?.trim().toLowerCase();
+
+    let cfVisitorScheme = '';
+    const cfVisitorRaw = req.headers.get('cf-visitor');
+    if (cfVisitorRaw) {
+      try {
+        const parsed = JSON.parse(cfVisitorRaw) as { scheme?: unknown };
+        if (parsed.scheme === 'http' || parsed.scheme === 'https') {
+          cfVisitorScheme = parsed.scheme;
+        }
+      } catch {
+        // ignore invalid cf-visitor header
+      }
+    }
+
+    let sameHostOriginProto = '';
+    const reqOriginHeader = req.headers.get('origin');
+    if (reqOriginHeader) {
+      try {
+        const parsedOrigin = new URL(reqOriginHeader);
+        if (parsedOrigin.host.toLowerCase() === rawHost.toLowerCase()) {
+          const originProto = parsedOrigin.protocol.replace(':', '').toLowerCase();
+          if (originProto === 'http' || originProto === 'https') {
+            sameHostOriginProto = originProto;
+          }
+        }
+      } catch {
+        // ignore invalid origin header
+      }
+    }
+
     const protoRaw =
       forwardedProto === 'http' || forwardedProto === 'https'
         ? forwardedProto
-        : url.protocol.replace(':', '').toLowerCase();
+        : cfVisitorScheme || sameHostOriginProto || url.protocol.replace(':', '').toLowerCase();
     const proto = protoRaw === 'https' ? 'https' : 'http';
     const resolvedUrl = new URL(`${proto}://${rawHost}`);
     return {
@@ -142,16 +185,41 @@ function resolveRequestOrigin(
 }
 
 /**
+ * Clean up all in-memory Better Auth fallback records for a deleted user when running without D1.
+ */
+export function deleteUserFromMemoryAuthFallback(userId: string, email?: string): void {
+  const db = globalAuthFallback.__lowscore_memory_db;
+  if (!db) return;
+
+  if (Array.isArray(db.session)) {
+    db.session = db.session.filter((row) => row.userId !== userId);
+  }
+  if (Array.isArray(db.account)) {
+    db.account = db.account.filter((row) => row.userId !== userId);
+  }
+  if (Array.isArray(db.user)) {
+    db.user = db.user.filter((row) => row.id !== userId);
+  }
+  if (email && Array.isArray(db.verification)) {
+    const cleanEmail = email.trim().toLowerCase();
+    db.verification = db.verification.filter(
+      (row) => String(row.identifier || '').trim().toLowerCase() !== cleanEmail
+    );
+  }
+}
+
+/**
  * Creates a request-scoped Better Auth instance backed by Cloudflare D1.
  */
 export async function getAuth(request?: Request) {
-  const { d1, env } = await getCloudflareRuntime();
+  const { d1, env, waitUntil } = await getCloudflareRuntime();
 
   if (d1) {
     await ensureD1Schema(d1);
+    maybeAutoCleanupDatabase(d1, waitUntil);
   }
 
-  let requestOrigin = 'http://localhost:3005';
+  let requestOrigin = '';
   let requestHostname = 'localhost';
   if (request) {
     const resolved = resolveRequestOrigin(request);
@@ -167,9 +235,7 @@ export async function getAuth(request?: Request) {
     process.env.NEXT_PUBLIC_APP_URL?.trim() ||
     '';
 
-  const baseURL = isLocalHostname(requestHostname)
-    ? requestOrigin
-    : configuredBaseUrl || requestOrigin;
+  const baseURL = requestOrigin || configuredBaseUrl || 'http://localhost:3005';
 
   const configuredSecret =
     (typeof env.BETTER_AUTH_SECRET === 'string' && env.BETTER_AUTH_SECRET.trim()) ||
@@ -199,33 +265,38 @@ export async function getAuth(request?: Request) {
     trustedOrigins: async (req) => {
       const origins = new Set<string>([
         baseURL,
-        requestOrigin,
         'http://localhost:3005',
         'http://localhost:3000',
         'http://localhost:8787',
         'http://127.0.0.1:3005',
         'http://127.0.0.1:3000',
       ]);
+      if (requestOrigin) origins.add(requestOrigin);
       if (configuredBaseUrl) origins.add(configuredBaseUrl);
       if (req) {
         const resolved = resolveRequestOrigin(req);
         if (resolved) {
           origins.add(resolved.origin);
-          const reqOriginHeader = req.headers.get('origin');
-          if (reqOriginHeader) {
-            try {
-              const parsedOrigin = new URL(reqOriginHeader);
-              if (
-                parsedOrigin.host === resolved.host &&
-                parsedOrigin.protocol === resolved.protocol
-              ) {
-                origins.add(parsedOrigin.origin);
-              }
-            } catch {
-              // ignore malformed Origin header
-            }
-          }
         }
+        const addTrustedHeaderOrigin = (rawHeaderUrl: string | null) => {
+          if (!rawHeaderUrl) return;
+          try {
+            const parsedOrigin = new URL(rawHeaderUrl);
+            const sameResolvedHost =
+              resolved && parsedOrigin.host.toLowerCase() === resolved.host.toLowerCase();
+            if (
+              sameResolvedHost ||
+              isLocalHostname(parsedOrigin.hostname) ||
+              isTrustedProxyOrigin(parsedOrigin)
+            ) {
+              origins.add(parsedOrigin.origin);
+            }
+          } catch {
+            // ignore malformed Origin/Referer header
+          }
+        };
+        addTrustedHeaderOrigin(req.headers.get('origin'));
+        addTrustedHeaderOrigin(req.headers.get('referer'));
       }
       return Array.from(origins);
     },
@@ -239,6 +310,9 @@ export async function getAuth(request?: Request) {
       },
     },
     user: {
+      deleteUser: {
+        enabled: true,
+      },
       additionalFields: {
         soundEnabled: {
           type: 'boolean',

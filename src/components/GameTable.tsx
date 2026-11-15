@@ -10,7 +10,7 @@ import {
   getSuitSymbol,
   isValidDiscard,
 } from '@/lib/gameEngine';
-import { PlayingCard } from './PlayingCard';
+import { MiniCardBack, PlayingCard } from './PlayingCard';
 import { soundFX } from '@/lib/soundEffects';
 import {
   Crown,
@@ -106,7 +106,7 @@ function PlayerRoundsStrip({
             </div>
           );
         }
-        const isWin = rs.outcome === 'win' || rs.score === 0;
+        const isWin = rs.outcome === 'win';
         const isLose = rs.outcome === 'lose';
         const colorClass = isWin
           ? 'text-emerald-600 font-bold'
@@ -945,11 +945,7 @@ export function GameTable({
                     </span>
                   ) : (
                     <div className="flex items-center gap-1 sm:gap-2 min-w-0">
-                      <img
-                        src="/cards/card_back.png"
-                        alt="Card Back"
-                        className="w-3 h-[18px] sm:w-4 sm:h-6 rounded-[2px] border border-stone-300 shadow-2xs object-fill shrink-0"
-                      />
+                      <MiniCardBack className="w-3 h-[18px] sm:w-4 sm:h-6" />
                       <span className="text-[8.5px] sm:text-xs text-emerald-700 font-medium truncate">
                         {opp.disconnectedAt ? '🤖 Away' : 'Remaining'}
                       </span>
@@ -1634,9 +1630,10 @@ export function GameTable({
             </div>
             <p className="text-xs text-stone-600 leading-relaxed">
               Are you sure you want to declare your hand with <strong>{myHandSum} points</strong>?
-              <br />• If you have the strictly lowest hand, you win with{' '}
-              <strong className="text-emerald-600">0★ points</strong>.
-              <br />• If any opponent has an equal or lower sum, you suffer a{' '}
+              <br />• If no opponent has a strictly lower sum, you win with{' '}
+              <strong className="text-emerald-600">0★ points</strong> (tying opponents get{' '}
+              <strong className="text-blue-600">+0</strong>).
+              <br />• Only if an opponent has a strictly lower sum do you suffer a{' '}
               <strong className="text-red-600">+20 + difference</strong> undercut penalty!
             </p>
             <div className="flex justify-end gap-2 pt-2">
@@ -1820,19 +1817,19 @@ export function GameTable({
                 <strong>{room.lastRoundSummary.declarerSum} pts</strong>. Lowest opponent hand was{' '}
                 <strong>{room.lastRoundSummary.minOpponentSum} pts</strong>.{' '}
                 {room.lastRoundSummary.undercut
-                  ? `Because an opponent had an equal or lower sum, ${
+                  ? `Because an opponent had a strictly lower sum, ${
                       room.lastRoundSummary.declarerName
                     } received an undercut loss of 20 + (${room.lastRoundSummary.declarerSum} - ${
                       room.lastRoundSummary.minOpponentSum
                     }) = +${
                       20 + (room.lastRoundSummary.declarerSum - room.lastRoundSummary.minOpponentSum)
                     } pts!`
-                  : `Every opponent receives the difference between their hand sum and ${room.lastRoundSummary.declarerSum} pts.`}
+                  : `Every opponent receives the difference between their hand sum and ${room.lastRoundSummary.declarerSum} pts (+0 on a tie).`}
               </p>
 
               <div className="space-y-2.5">
                 {room.lastRoundSummary.playerResults.map((res) => {
-                  const isWin = res.outcome === 'win' || res.pointsAdded === 0;
+                  const isWin = res.outcome === 'win';
                   const isLose = res.outcome === 'lose';
                   const scoreColor = isWin
                     ? 'text-emerald-600'

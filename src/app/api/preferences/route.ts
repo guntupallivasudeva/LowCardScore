@@ -1,7 +1,12 @@
 import { NextRequest } from 'next/server';
 import { getAuth } from '@/lib/auth';
 import { noStoreJson } from '@/lib/cloudflareDb';
-import { getPlayerPreference, savePlayerPreference } from '@/lib/serverStore';
+import { DeckDifficulty, normalizeDeckDifficulty } from '@/lib/gameEngine';
+import {
+  getPlayerPreference,
+  isRegisteredUserInStore,
+  savePlayerPreference,
+} from '@/lib/serverStore';
 
 export const dynamic = 'force-dynamic';
 
@@ -10,6 +15,19 @@ export async function GET(req: NextRequest) {
     const auth = await getAuth(req);
     const session = await auth.api.getSession({ headers: req.headers }).catch(() => null);
     const requestedId = req.nextUrl.searchParams.get('userId')?.trim() || '';
+
+    if (!session?.user?.id) {
+      if (!requestedId) {
+        return noStoreJson({ error: 'Missing userId' }, { status: 400 });
+      }
+      if (!requestedId.startsWith('guest_') || (await isRegisteredUserInStore(requestedId))) {
+        return noStoreJson(
+          { error: 'Authentication required. Please log in again.' },
+          { status: 401 }
+        );
+      }
+    }
+
     const targetId = session?.user?.id || requestedId;
 
     if (!targetId) {
@@ -26,6 +44,7 @@ export async function GET(req: NextRequest) {
           'boolean'
             ? (session?.user as { soundEnabled?: boolean }).soundEnabled!
             : true,
+        defaultDeckDifficulty: 'medium' as DeckDifficulty,
         updatedAt: Date.now(),
       },
     });
@@ -43,11 +62,24 @@ export async function POST(req: NextRequest) {
       userId?: string;
       name?: string;
       soundEnabled?: boolean;
+      defaultDeckDifficulty?: DeckDifficulty;
     };
 
     const auth = await getAuth(req);
     const session = await auth.api.getSession({ headers: req.headers }).catch(() => null);
     const requestedId = typeof body.userId === 'string' ? body.userId.trim() : '';
+
+    if (!session?.user?.id) {
+      if (!requestedId) {
+        return noStoreJson({ error: 'Missing userId or active session' }, { status: 400 });
+      }
+      if (!requestedId.startsWith('guest_') || (await isRegisteredUserInStore(requestedId))) {
+        return noStoreJson(
+          { error: 'Authentication required. Please log in again.' },
+          { status: 401 }
+        );
+      }
+    }
 
     // Registered users always bind to their authenticated session ID unless operating as guest
     const targetId = session?.user?.id || requestedId;
@@ -60,10 +92,15 @@ export async function POST(req: NextRequest) {
         ? body.name.trim().slice(0, 24)
         : undefined;
     const soundEnabled = typeof body.soundEnabled === 'boolean' ? body.soundEnabled : undefined;
+    const defaultDeckDifficulty =
+      body.defaultDeckDifficulty !== undefined
+        ? normalizeDeckDifficulty(body.defaultDeckDifficulty)
+        : undefined;
 
     const saved = await savePlayerPreference(targetId, {
       name: cleanName,
       soundEnabled,
+      defaultDeckDifficulty,
     });
 
     return noStoreJson({ ok: true, preferences: saved });

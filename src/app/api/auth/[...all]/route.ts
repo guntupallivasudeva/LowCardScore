@@ -13,9 +13,30 @@ function withNoStoreHeaders(response: Response): Response {
   });
 }
 
+async function normalizeAuthRequest(request: Request): Promise<Request> {
+  const method = request.method.toUpperCase();
+  if (
+    (method === 'POST' || method === 'PUT' || method === 'PATCH') &&
+    !request.headers.get('content-type')
+  ) {
+    const rawBody = await request.text().catch(() => '');
+    const headers = new Headers(request.headers);
+    headers.set('content-type', 'application/json');
+    headers.delete('content-length');
+    const body = rawBody.trim().length > 0 ? rawBody : '{}';
+    return new Request(request.url, {
+      method,
+      headers,
+      body,
+    });
+  }
+  return request;
+}
+
 async function handleAuthRequest(request: Request): Promise<Response> {
-  const auth = await getAuth(request);
-  const res = await auth.handler(request);
+  const normalizedRequest = await normalizeAuthRequest(request);
+  const auth = await getAuth(normalizedRequest);
+  const res = await auth.handler(normalizedRequest);
   return withNoStoreHeaders(res);
 }
 

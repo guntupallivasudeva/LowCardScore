@@ -2,9 +2,11 @@ import {
   Card,
   Player,
   RoomState,
-  createDeck,
+  dealBalancedDeck,
+  drawFromShuffledDeck,
   getHandSum,
   isValidDiscard,
+  normalizeDeckDifficulty,
   shuffle,
   canPlayerDeclare,
   computeBotAction,
@@ -34,6 +36,7 @@ export function createInitialRoom(
       turnTimer: 45,
       maxPlayers: 8,
       cardsPerPlayer: 5,
+      deckDifficulty: 'medium',
     },
     botsConfig: {
       includeAI: false,
@@ -64,6 +67,7 @@ export function createInitialRoom(
     roundNumber: 1,
     turnStartTime: now,
     chat: [],
+    createdAt: now,
     updatedAt: now,
   };
 }
@@ -71,9 +75,43 @@ export function createInitialRoom(
 const BOT_NAMES_EASY = ['Bot Rookie', 'Bot Sunny', 'Bot Clover', 'Bot Pip', 'Bot Daisy', 'Bot Lucky'];
 const BOT_NAMES_HARD = ['Bot Magnus', 'Bot Athena', 'Bot Cipher', 'Bot Viper', 'Bot Kronos', 'Bot Apex'];
 
+/**
+ * Enforces deterministic table & lobby ordering:
+ * 1. Current Host is always 1st (#1)
+ * 2. Remaining human players follow strictly in their original join order (`joinedAt` ascending)
+ * 3. AI Bots follow after human players
+ */
+export function sortPlayersByJoinOrder(players: Player[], hostId: string): Player[] {
+  const indexed = players.map((p, index) => ({ p, index }));
+
+  const humans = indexed
+    .filter(({ p }) => !p.isBot)
+    .sort((a, b) => {
+      const aIsHost = a.p.id === hostId;
+      const bIsHost = b.p.id === hostId;
+      if (aIsHost !== bIsHost) return aIsHost ? -1 : 1;
+      const timeDiff = (a.p.joinedAt || 0) - (b.p.joinedAt || 0);
+      if (timeDiff !== 0) return timeDiff;
+      return a.index - b.index;
+    })
+    .map(({ p }) => ({ ...p, isHost: p.id === hostId }));
+
+  const bots = indexed
+    .filter(({ p }) => p.isBot)
+    .sort((a, b) => {
+      const timeDiff = (a.p.joinedAt || 0) - (b.p.joinedAt || 0);
+      if (timeDiff !== 0) return timeDiff;
+      return a.index - b.index;
+    })
+    .map(({ p }) => ({ ...p, isHost: false }));
+
+  return [...humans, ...bots];
+}
+
 export function syncBotsInLobby(room: RoomState): RoomState {
-  const humanPlayers = [...room.players.filter((p) => !p.isBot)].sort(
-    (a, b) => a.joinedAt - b.joinedAt
+  const humanPlayers = sortPlayersByJoinOrder(
+    room.players.filter((p) => !p.isBot),
+    room.hostId
   );
 
   if (!room.botsConfig.includeAI) {
@@ -135,28 +173,23 @@ export function syncBotsInLobby(room: RoomState): RoomState {
 
 export function startRound(room: RoomState, isFirstRound = false): RoomState {
   const sourcePlayers = isFirstRound ? room.players.filter((p) => !p.isKicked) : room.players;
-  const orderedPlayers = [
-    ...[...sourcePlayers.filter((p) => !p.isBot)].sort((a, b) => a.joinedAt - b.joinedAt),
-    ...sourcePlayers.filter((p) => p.isBot),
-  ];
+  const orderedPlayers = sortPlayersByJoinOrder(sourcePlayers, room.hostId);
 
   const activePlayers = orderedPlayers.filter((p) =>
     isFirstRound ? true : !p.isEliminated && !p.isKicked
   );
   const cardsPerHand = Math.max(3, Math.min(7, room.settings.cardsPerPlayer || 5));
   const numDecks = activePlayers.length * cardsPerHand >= 30 ? 2 : 1;
-  const fullDeck = createDeck(numDecks);
+  const difficulty = normalizeDeckDifficulty(room.settings.deckDifficulty);
 
-  // Deal one card at a time to each active player in turn (round-robin), like a real dealer
+  // Deal one card at a time in round-robin order calibrated to the room's deck difficulty
   const dealOrder = activePlayers;
-  const dealtHands = new Map<string, Card[]>(dealOrder.map((p) => [p.id, []]));
-  let deckCursor = 0;
-  for (let round = 0; round < cardsPerHand; round++) {
-    for (const p of dealOrder) {
-      dealtHands.get(p.id)!.push({ ...fullDeck[deckCursor], isNew: false });
-      deckCursor += 1;
-    }
-  }
+  const { dealtHands, firstVisible, remainingDeck } = dealBalancedDeck(
+    dealOrder.map((p) => p.id),
+    cardsPerHand,
+    numDecks,
+    difficulty
+  );
 
   const updatedPlayers = orderedPlayers.map((p) => {
     if (isFirstRound) {
@@ -174,27 +207,30 @@ export function startRound(room: RoomState, isFirstRound = false): RoomState {
     };
   });
 
-  const firstVisible = fullDeck[deckCursor];
-  deckCursor += 1;
-  const remainingDeck = fullDeck.slice(deckCursor);
-
-  const nonEliminated = updatedPlayers.filter((p) => !p.isEliminated);
+  const nonEliminated = updatedPlayers.filter((p) => !p.isEliminated && !p.isKicked);
   let startingPlayer = nonEliminated[0];
 
   if (!isFirstRound && nonEliminated.length > 0) {
-    const prevStarterId = room.roundStarterPlayerId || room.currentTurnPlayerId;
-    const prevIdx = updatedPlayers.findIndex((p) => p.id === prevStarterId);
+    const prevStarterId = room.roundStarterPlayerId;
+    const prevIdx = prevStarterId ? updatedPlayers.findIndex((p) => p.id === prevStarterId) : -1;
     if (prevIdx !== -1) {
       for (let offset = 1; offset <= updatedPlayers.length; offset++) {
         const candidate = updatedPlayers[(prevIdx + offset) % updatedPlayers.length];
-        if (!candidate.isEliminated) {
+        if (!candidate.isEliminated && !candidate.isKicked) {
           startingPlayer = candidate;
           break;
         }
       }
+    } else if (room.roundStarterNextId) {
+      const preservedNext = nonEliminated.find((p) => p.id === room.roundStarterNextId);
+      startingPlayer =
+        preservedNext ||
+        nonEliminated[(Math.max(1, room.roundNumber) - 1) % nonEliminated.length] ||
+        nonEliminated[0];
     } else {
       startingPlayer =
-        nonEliminated[(room.roundNumber - 1) % nonEliminated.length] || nonEliminated[0];
+        nonEliminated[(Math.max(1, room.roundNumber) - 1) % nonEliminated.length] ||
+        nonEliminated[0];
     }
   }
 
@@ -207,6 +243,7 @@ export function startRound(room: RoomState, isFirstRound = false): RoomState {
     exposedPile: [],
     currentTurnPlayerId: startingPlayer.id,
     roundStarterPlayerId: startingPlayer.id,
+    roundStarterNextId: undefined,
     turnsPlayedInRound: 0,
     turnStartTime: Date.now(),
     lastRoundSummary: undefined,
@@ -249,6 +286,9 @@ export function executeMakeMove(
   let currentDeck = [...room.deck];
   let currentExposed = [...room.exposedPile];
   const currentVisible = [...room.visibleCards];
+  const remainingHand = player.hand
+    .filter((c) => !discardIds.includes(c.id))
+    .map((c) => ({ ...c, isNew: false }));
 
   let drawnCard: Card | undefined;
 
@@ -263,17 +303,19 @@ export function executeMakeMove(
       currentDeck = shuffle(currentExposed);
       currentExposed = [];
     }
-    drawnCard = currentDeck.shift();
+    const drawResult = drawFromShuffledDeck(
+      currentDeck,
+      remainingHand,
+      normalizeDeckDifficulty(room.settings.deckDifficulty)
+    );
+    drawnCard = drawResult.card;
+    currentDeck = drawResult.remainingDeck;
     currentExposed.push(...currentVisible);
   }
 
   if (!drawnCard) {
     return { room, error: 'No cards left to draw' };
   }
-
-  const remainingHand = player.hand
-    .filter((c) => !discardIds.includes(c.id))
-    .map((c) => ({ ...c, isNew: false }));
 
   const updatedHand = [...remainingHand, { ...drawnCard, isNew: true }];
 
@@ -349,7 +391,9 @@ export function executeDeclare(
   const minOpponentSum =
     opponents.length > 0 ? Math.min(...opponents.map((o) => getHandSum(o.hand))) : 999;
 
-  const isUndercut = declarerSum >= minOpponentSum;
+  // Undercut occurs ONLY when an opponent holds a strictly lower sum than the declarer;
+  // ties favor the declarer (declarer wins 0★, tying opponent scores +0).
+  const isUndercut = declarerSum > minOpponentSum;
 
   const playerResults: NonNullable<RoomState['lastRoundSummary']>['playerResults'] = [];
 
@@ -368,19 +412,19 @@ export function executeDeclare(
         pointsAdded = 20 + (declarerSum - minOpponentSum);
         outcome = 'lose';
       } else {
-        // Declarer won -> 0 in GREEN + STAR ★
+        // Declarer won (strictly lowest or tied for lowest) -> 0 in GREEN + STAR ★
         pointsAdded = 0;
         outcome = 'win';
       }
     } else {
       if (isUndercut) {
-        // Opponents win when declarer is undercut -> 0 in GREEN + STAR ★ for those who beat/tied declarer
+        // Opponents win when declarer is undercut -> 0 in GREEN + STAR ★
         pointsAdded = 0;
         outcome = 'win';
       } else {
-        // Score added because of another player's declare -> BLUE score
+        // Declarer won -> opponents pay difference (same sum = +0 without winner star)
         pointsAdded = Math.max(0, handSum - declarerSum);
-        outcome = pointsAdded === 0 ? 'win' : 'other_declare';
+        outcome = 'other_declare';
       }
     }
 
@@ -462,9 +506,29 @@ export function kickOrRemovePlayer(
   forceRemove = false
 ): RoomState | null {
   const shouldHardRemove = forceRemove || room.status === 'lobby';
+  const orderedBeforeRemoval = sortPlayersByJoinOrder(room.players, room.hostId);
 
   if (shouldHardRemove) {
-    const remaining = room.players.filter((p) => p.id !== targetPlayerId);
+    let nextRoundStarterAfterRemoval = room.roundStarterNextId;
+    if (
+      room.status !== 'lobby' &&
+      (targetPlayerId === room.roundStarterPlayerId || targetPlayerId === room.roundStarterNextId)
+    ) {
+      const removedIdx = orderedBeforeRemoval.findIndex((p) => p.id === targetPlayerId);
+      nextRoundStarterAfterRemoval = undefined;
+      if (removedIdx !== -1) {
+        for (let offset = 1; offset < orderedBeforeRemoval.length; offset++) {
+          const cand =
+            orderedBeforeRemoval[(removedIdx + offset) % orderedBeforeRemoval.length];
+          if (cand.id !== targetPlayerId && !cand.isEliminated && !cand.isKicked) {
+            nextRoundStarterAfterRemoval = cand.id;
+            break;
+          }
+        }
+      }
+    }
+
+    const remaining = orderedBeforeRemoval.filter((p) => p.id !== targetPlayerId);
     const remainingHumans = remaining.filter((p) => !p.isBot && !p.isKicked);
     if (remainingHumans.length === 0) {
       return null;
@@ -475,10 +539,7 @@ export function kickOrRemovePlayer(
       newHostId = remainingHumans[0].id;
     }
 
-    const updatedPlayers = remaining.map((p) => ({
-      ...p,
-      isHost: p.id === newHostId,
-    }));
+    const updatedPlayers = sortPlayersByJoinOrder(remaining, newHostId);
 
     let nextTurnId = room.currentTurnPlayerId;
     if (room.status === 'playing' && room.currentTurnPlayerId === targetPlayerId) {
@@ -498,6 +559,7 @@ export function kickOrRemovePlayer(
       hostId: newHostId,
       players: updatedPlayers,
       currentTurnPlayerId: nextTurnId,
+      roundStarterNextId: nextRoundStarterAfterRemoval,
       turnStartTime: room.currentTurnPlayerId === targetPlayerId ? Date.now() : room.turnStartTime,
       status,
       winnerId,
@@ -506,10 +568,10 @@ export function kickOrRemovePlayer(
   }
 
   // During an active/completed match, preserve kicked players in the table/scoreboard with `isKicked: true`
-  const target = room.players.find((p) => p.id === targetPlayerId);
+  const target = orderedBeforeRemoval.find((p) => p.id === targetPlayerId);
   const reclaimedHand = target?.hand || [];
 
-  const markedPlayers = room.players.map((p) =>
+  const markedPlayers = orderedBeforeRemoval.map((p) =>
     p.id === targetPlayerId
       ? {
           ...p,
@@ -533,10 +595,7 @@ export function kickOrRemovePlayer(
     newHostId = remainingHumans[0].id;
   }
 
-  const updatedPlayers = markedPlayers.map((p) => ({
-    ...p,
-    isHost: p.id === newHostId,
-  }));
+  const updatedPlayers = sortPlayersByJoinOrder(markedPlayers, newHostId);
 
   let nextTurnId = room.currentTurnPlayerId;
   if (room.status === 'playing' && room.currentTurnPlayerId === targetPlayerId) {
