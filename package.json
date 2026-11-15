@@ -18,7 +18,7 @@
     "@opennextjs/cloudflare": "^1.20.17",
     "better-auth": "^1.7.25",
     "canvas-confetti": "^1.9.3",
-    "lucide-react": "^0.475.0",
+    "lucide-react": "^1.72.0",
     "next": "^15.5.29",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
